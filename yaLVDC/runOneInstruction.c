@@ -16,6 +16,16 @@
  * along with yaAGC; if not, write to the Free Software
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  *
+ * In addition, as a special exception, Ronald S. Burkey gives permission to
+ * link the code of this program with the Orbiter SDK library (or with
+ * modified versions of the Orbiter SDK library that use the same license as
+ * the Orbiter SDK library), and distribute linked combinations including
+ * the two. You must obey the GNU General Public License in all respects for
+ * all of the code used other than the Orbiter SDK library. If you modify
+ * this file, you may extend this exception to your version of the file,
+ * but you are not obligated to do so. If you do not wish to do so, delete
+ * this exception statement from your version.
+ *
  * Filename:    runOneInstruction.c
  * Purpose:     Emulates one instruction for yaLVDC.c, using the global state
  * 		structure. Also provides various related utility functions that
@@ -26,8 +36,15 @@
  */
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include "yaLVDC.h"
+
+// Different fields of an LVDC/PTC data word.
+#define signMask        0200000000
+#define dataWordMask    0377777777
+
+//#define DEBUG_A_LOT
 
 //////////////////////////////////////////////////////////////////////////////
 
@@ -37,23 +54,24 @@
 // 0 on success, 1 on failure, the latter of which can occur if the input
 // hopConstant isn't formatted correctly.
 int
-parseHopConstant (int hopConstant, hopStructure_t *hopStructure)
+parseHopConstant(int hopConstant, hopStructure_t *hopStructure)
 {
   int retVal = 1;
 
-  if ((hopConstant & ~777577776) != 0)
+  if ((!ptc && (hopConstant & 0100000) != 0)
+      || (ptc && (hopConstant & 03300003) != 0))
     {
-      pushErrorMessage ("Corrupted HOP constant", NULL);
+      //pushErrorMessage("Corrupted HOP constant", NULL);
       goto done;
     }
-  hopStructure->im = ((hopConstant >> 26) & 1) | (hopConstant & 6);
-  hopStructure->is = (hopConstant >> 3) & 017;
-  hopStructure->s = (hopConstant >> 7) & 1;
-  hopStructure->loc = (hopConstant >> 8) & 0377;
-  hopStructure->dupdn = (hopConstant >> 17) & 1;
-  hopStructure->dm = (hopConstant >> 18) & 7;
-  hopStructure->ds = (hopConstant >> 21) & 017;
-  hopStructure->ds = (hopConstant >> 25) & 1;
+  hopStructure->im = ((hopConstant >> 25) & 1) | ((hopConstant << 1) & 6);
+  hopStructure->is = (hopConstant >> 2) & 017;
+  hopStructure->s = (hopConstant >> 6) & 1;
+  hopStructure->loc = (hopConstant >> 7) & 0377;
+  hopStructure->dupdn = (hopConstant >> 16) & 1;
+  hopStructure->dm = (hopConstant >> 17) & 7;
+  hopStructure->ds = (hopConstant >> 20) & 017;
+  hopStructure->dupin = (hopConstant >> 24) & 1;
 
   retVal = 0;
   done: ;
@@ -63,34 +81,35 @@ parseHopConstant (int hopConstant, hopStructure_t *hopStructure)
 // Inverse operation of parseHopConstant():  Namely, form a HOP constant from
 // a hop structure.  Returns 0 on success and 1 on failure.
 int
-formHopConstant (hopStructure_t *hopStructure, int *hopConstant)
+formHopConstant(hopStructure_t *hopStructure, int *hopConstant)
 {
   int retVal = 1;
 
   if (hopStructure->im > 7)
     goto done;
-  *hopConstant = (hopStructure->im & 06) | ((hopStructure->im & 1) << 26);
+  *hopConstant = ((hopStructure->im >> 1) & 03)
+      | ((hopStructure->im & 1) << 25);
   if (hopStructure->is > 017)
     goto done;
-  *hopConstant |= hopStructure->is << 3;
+  *hopConstant |= hopStructure->is << 2;
   if (hopStructure->s > 1)
     goto done;
-  *hopConstant |= hopStructure->s << 7;
+  *hopConstant |= hopStructure->s << 6;
   if (hopStructure->loc > 0377)
     goto done;
-  *hopConstant |= hopStructure->loc << 8;
+  *hopConstant |= hopStructure->loc << 7;
   if (hopStructure->dupdn > 1)
     goto done;
-  *hopConstant |= hopStructure->dupdn << 17;
+  *hopConstant |= hopStructure->dupdn << 16;
   if (hopStructure->dm > 7)
     goto done;
-  *hopConstant |= hopStructure->dm << 18;
+  *hopConstant |= hopStructure->dm << 17;
   if (hopStructure->ds > 017)
     goto done;
-  *hopConstant |= hopStructure->ds << 21;
+  *hopConstant |= hopStructure->ds << 20;
   if (hopStructure->dupin > 1)
     goto done;
-  *hopConstant |= hopStructure->dupin << 25;
+  *hopConstant |= hopStructure->dupin << 24;
 
   retVal = 0;
   done: ;
@@ -111,9 +130,10 @@ formHopConstant (hopStructure_t *hopStructure, int *hopConstant)
 // Note that address 0775 is treated as a special case, since the data comes
 // from the CPU's PQ register rather than from memory.
 
+int inhibitFetchMessages = 0;
 int
-fetchData (int module, int residual, int sector, int loc, int16_t *data,
-	   int *dataFromInstructionMemory)
+fetchData(int module, int residual, int sector, int loc, int *data,
+    int32_t *dataFromInstructionMemory)
 {
   int retVal = 1;
 
@@ -121,27 +141,46 @@ fetchData (int module, int residual, int sector, int loc, int16_t *data,
 
   if (residual)
     {
-      if (loc == 0375)
-	{
-	  *data = state.pq;
-	  return (0);
-	}
+      if (!ptc && loc == 0375)
+        {
+          *data = state.pq;
+          return (0);
+        }
       sector = 017;
+      if (ptc)
+        module = 0;
     }
+
   *data = state.core[module][sector][2][loc];
   if (*data == -1)
     {
       int16_t fetch1, fetch0;
       fetch1 = state.core[module][sector][1][loc];
       fetch0 = state.core[module][sector][0][loc];
-      if (fetch0 == -1 || fetch1 == -1)
-	{
-	  pushErrorMessage ("Fetching data from empty location", NULL);
-	  goto done;
-	}
-      *data = (fetch1 << 12) + fetch0;
+      // Note that fetching data from a completely-empty location
+      // may be an error (or perhaps not?), but that fetching from a
+      // partially-empty location is not, since the LVDC/PTC code
+      // is self-modifying, and may need to do that to modify the
+      // code.
+      if (fetch0 == -1 && fetch1 == -1)
+        {
+          if (!inhibitFetchMessages)
+            printf("Fetching data from empty location %o-%02o-%03o\n", module,
+                sector, loc);
+          runStepN = 0;
+          goto done;
+        }
+      if (fetch0 == -1)
+        fetch0 = 0;
+      if (fetch1 == -1)
+        fetch1 = 0;
+      *data = (fetch1 << 13) + fetch0;
       *dataFromInstructionMemory = 1;
     }
+
+#ifdef DEBUG_A_LOT
+  printf("Fetched %09o from %o-%02o-%03o\n", *data, module, sector, loc);
+#endif
 
   retVal = 0;
   done: ;
@@ -157,12 +196,12 @@ fetchData (int module, int residual, int sector, int loc, int16_t *data,
 // Note that addresses 0775, 0776, and 0777 are treated as special cases.  For
 // 0775, the data destination is the CPU's PQ register rather than memory.
 // For 0776 or 0777, the data from the function argument is overridden and
-// state.returnAddress is used instead if appropriate.  This happens if the
-// preceding instruction was a HOP, and thus state.returnAddress holds the
+// state.hopSaver is used instead if appropriate.  This happens if the
+// preceding instruction was a HOP, and thus state.hopSaver holds the
 // return address of the HOP.
 int
-storeData (int module, int residual, int sector, int loc, int16_t data,
-	   int *dataOverwritesInstructionMemory)
+storeData(int module, int residual, int sector, int loc, int data,
+    int32_t *dataOverwritesInstructionMemory)
 {
   int retVal = 1;
 
@@ -171,12 +210,14 @@ storeData (int module, int residual, int sector, int loc, int16_t data,
   if (residual)
     {
       if (loc == 0375)
-	{
-	  state.pq = data;
-	  return (0);
-	}
-      else if (state.returnAddress != -2 && (loc == 0376 || loc == 0377))
-	data = state.returnAddress;
+        {
+          state.pq = data;
+          return (0);
+        }
+      else if (loc == 0376 || loc == 0377)
+        data = state.hopSaver;
+      if (ptc)
+        module = 0;
       sector = 017;
     }
   state.core[module][sector][2][loc] = data;
@@ -188,6 +229,10 @@ storeData (int module, int residual, int sector, int loc, int16_t data,
       *dataOverwritesInstructionMemory = 1;
     }
 
+#ifdef DEBUG_A_LOT
+  printf("Stored  %09o to %o-%02o-%03o\n", data, module, sector, loc);
+#endif
+
   retVal = 0;
   //done: ;
   return (retVal);
@@ -197,40 +242,52 @@ storeData (int module, int residual, int sector, int loc, int16_t data,
 // memory; if that fails, get it from data memory and set a flag
 // (instructionFromDataMemory) for optional use by the calling code.
 int
-fetchInstruction (int module, int residual, int sector, int syllable, int loc,
-		  uint16_t *instruction, int *instructionFromDataMemory)
+fetchInstruction(int module, int sector, int syllable, int loc,
+    uint16_t *instruction, int *instructionFromDataMemory)
 {
-  int retVal = 1;
+  int retVal = 1, fetchedData;
   *instructionFromDataMemory = 0;
-  if (residual)
-    sector = 017;
-  *instruction = state.core[module][sector][syllable][loc];
-  if (*instruction == -1)
+  fetchedData = state.core[module][sector][syllable][loc];
+  if (fetchedData == -1)
     {
-      int fetchedData;
       fetchedData = state.core[module][sector][2][loc];
       if (fetchedData == -1)
-	{
-	  pushErrorMessage ("Cannot fetch instruction from empty address",
-	  NULL);
-	  goto done;
-	}
+        {
+          if (!inhibitFetchMessages)
+            printf("Cannot fetch instruction from empty data address\n");
+          goto done;
+        }
       *instructionFromDataMemory = 1;
       if (syllable == 1)
-	*instruction = (fetchedData >> 12) & 077774;
-      else
-	*instruction = fetchedData & 037776;
+        fetchedData = fetchedData >> 13;
+      fetchedData &= 017777;
     }
-  // Right-align the instruction to normalize it.  (Recall that instructions
-  // in syllables 0 and 1 are aligned differently in our memory buffer.)
-  if (syllable == 0)
-    *instruction = *instruction >> 2;
-  else
-    *instruction = *instruction >> 1;
 
+  *instruction = fetchedData;
   retVal = 0;
   done: ;
   return (retVal);
+}
+
+// Sign-extend an LVDC/PTC data word to a native signed integer, for computations.
+int
+convertDataWordToNative(int dataWord)
+{
+  if ((signMask & dataWord) != 0)
+    {
+      // This method assumes that the target computer running the
+      // LVDC/PTC emulator uses 2's-complement arithmetic.
+      dataWord |= ~dataWordMask;
+    }
+  return dataWord;
+}
+// Truncate a native signed integer to an LVDC/PTC data word.
+int
+convertNativeToDataWord(int integer)
+{
+  // This method assumes that the target computer running the
+  // LVDC/PTC emulator uses 2's-complement arithmetic.
+  return (integer & dataWordMask);
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -243,262 +300,505 @@ int instructionFromDataMemory = 0;
 int dataFromInstructionMemory = 0;
 int dataOverwritesInstructionMemory = 0;
 int
-runOneInstruction (int *cyclesUsed)
+runOneInstruction(int *cyclesUsed)
 {
   int retVal = 1;
   int cycleCount = 1, nextLOC, nextS, isHOP = 0;
   int64_t dummy;  // For multiplication intermediate result.
-  hopStructure_t hopStructure, rawHopStructure;
+  hopStructure_t hopStructure, rawHopStructure, rawestHopStructure;
   uint16_t instruction;
-  uint8_t op, operand, residual;
-  int16_t fetchedFromMemory;
-  int modOperand = 0;
+  uint8_t op, operand, residual, a8, a9;
+  int32_t fetchedFromMemory;
+  //int modOperand = 0;
+
+  // If we changes any of state.pio[], state.cio[], or state.prs, then
+  // the following state.xxxChange variables will be set accordingly to
+  // indicate to external code that some action is needed before emulating
+  // the next CPU instruction.
+  state.pioChange = -1;
+  state.cioChange = -1;
+  state.prsChange = -1;
+  state.lastHop = -1;
 
   // Set global variables providing background info on the emulation.
   dataFromInstructionMemory = 0;
   instructionFromDataMemory = 0;
 
-  // Find current instruction address and data-sector environment, by parsing
-  // the HOP register to find its various fields.
-  if (parseHopConstant (state.hop, &hopStructure))
+  reenterForEXM: ;
+  if (state.pendingEXM.pending)
     {
-      pushErrorMessage ("Cannot interpret current instruction address", NULL);
-      goto done;
+      state.pendingEXM.pending = 0;
+      state.hop = state.pendingEXM.pendingHop;
+      if (parseHopConstant(state.hop, &hopStructure))
+        {
+          printf("Cannot interpret current instruction address (HOP=%09o)\n",
+              state.hop);
+          runStepN = 0;
+          goto done;
+        }
+      if (parseHopConstant(state.pendingEXM.nextHop, &rawHopStructure))
+        {
+          printf("Cannot interpret next instruction address (HOP=%09o)\n",
+              state.pendingEXM.nextHop);
+          runStepN = 0;
+          goto done;
+        }
+      nextLOC = rawHopStructure.loc;
+      nextS = rawHopStructure.s;
+      instruction = state.pendingEXM.pendingInstruction;
     }
-  memcpy (&rawHopStructure, &hopStructure, sizeof(hopStructure_t));
-  // What would the next instruction location be in the normal course of events?
-  // Only the LOC field of the HOP constant is involved, but we'll track the S
-  // field as well, to facilitate working with TRA, TNZ, and TMI later.
-  nextLOC = hopStructure.loc;
-  nextS = hopStructure.s;
-  if (hopStructure.loc != 0377)
-    nextLOC += 1;
-
-  if (fetchInstruction (hopStructure.im, 0, hopStructure.is, hopStructure.s,
-			hopStructure.loc, &instruction,
-			&instructionFromDataMemory))
-    goto done;
-
-  // If this instruction turns out to be an EXM, it means that we'll have to
-  // repeat all the steps below for the instruction EXM will want to execute,
-  // so an EXM will end up just jumping back to here.
-  if (0)
+  else
     {
-      const uint8_t dss[] =
-	{ 004, 014, 005, 015, 006, 016, 007, 017 };
-      reenterForEXM: ;
-      cycleCount += 1;
-      // Note that hopStructure is used for executing the instruction, but
-      // not for generating the hopConstant beyond this one instruction, so
-      // we can change it temporarily here without side effects.
-      hopStructure.ds = dss[(instruction >> 4) & 7];
+      // Find current instruction address and data-sector environment, by parsing
+      // the HOP register to find its various fields.
+      if (parseHopConstant(state.hop, &hopStructure))
+        {
+          //pushErrorMessage("Cannot interpret current instruction address", NULL);
+          printf("Cannot interpret current instruction address (HOP=%09o)\n",
+              state.hop);
+          runStepN = 0;
+          goto done;
+        }
+      memcpy(&rawHopStructure, &hopStructure, sizeof(hopStructure_t));
+      // What would the next instruction location be in the normal course of events?
+      // Only the LOC field of the HOP constant is involved, but we'll track the S
+      // field as well, to facilitate working with TRA, TNZ, and TMI later.
+      nextLOC = hopStructure.loc;
+      nextS = hopStructure.s;
+      if (hopStructure.loc != 0377)
+        nextLOC += 1;
+
+      if (fetchInstruction(hopStructure.im, hopStructure.is, hopStructure.s,
+          hopStructure.loc, &instruction, &instructionFromDataMemory))
+        goto done;
     }
+  memcpy(&rawestHopStructure, &rawHopStructure, sizeof(hopStructure_t));
 
   // Parse instruction into fields.
+  state.lastInstruction = instruction;
   op = instruction & 017;
-  residual = (instruction >> 4) & 1;
+  a9 = (instruction >> 4) & 1;
   operand = (instruction >> 5) & 0377;
-  if (op == 016)
-    {
-      op = instruction & 037;
-      residual = 0;
-    }
-  if (op == 036)
-    {
-      op = op | ((instruction >> 7) & 040);
-      operand = operand & 0177;
-      residual = 0;
-    }
-  operand = (operand & ~3) | modOperand;
-  modOperand = 0;
+  a8 = (operand >> 7) & 1;
+  residual = a9;
+  // The following has something to do with EXM, but doesn't work as-is,
+  // since it messes up almost all operands.  Fix later.
+  //operand = (operand & ~3) | modOperand;
+  //modOperand = 0;
 
   // Execute the instruction.
-  switch (op)
+  if (op == 000)
     {
-    case 000:  // HOP
+      // HOP
       isHOP = 1;
-      if (fetchData (hopStructure.dm, residual, hopStructure.dm, operand,
-		     &fetchedFromMemory, &dataFromInstructionMemory))
-	{
-	  pushErrorMessage ("HOP to empty location", NULL);
-	  goto done;
-	}
+      if (fetchData(hopStructure.dm, residual, hopStructure.ds, operand,
+          &fetchedFromMemory, &dataFromInstructionMemory))
+        {
+          //pushErrorMessage("HOP to empty location", NULL);
+          printf("HOP to empty location\n");
+          runStepN = 0;
+          goto done;
+        }
+#ifdef DEBUG_A_LOT
+      printf("HOP %o-%02o-%o-%02o %09o\n", hopStructure.dm, residual, hopStructure.ds, operand, fetchedFromMemory);
+#endif
+      state.lastHop = state.hop;
       state.hop = fetchedFromMemory;
-      break;
-    case 001:  // MPY
-    case 005:  // MPH
+    }
+  else if (!ptc && (op == 001 || op == 005))
+    {
+      // MPY or MPH
       // The actual LVDC had a pretty complex behavior with this instruction,
       // in that the full 26-bit result would become available 4 cycles later,
       // but after 2 cycles you could fetch the less-significant word of the
       // result from PQ.  At least at first, I'm not going to implement it that
       // way, and I'll just provide the full result in PQ immediately.  I don't
       // see a problem with doing that.
-      if (fetchData (hopStructure.dm, residual, hopStructure.dm, operand,
-		     &fetchedFromMemory, &dataFromInstructionMemory))
-	goto done;
-      // Recall that only the most-significant 24 bits of the multiplicands
-      // are used by the CPU, and that the data is left-aligned at bit 27.
-      // The variable called "dummy" is 64-bit, and so is big enough to hold
-      // the 54-bit result temporarily.
-      dummy = (fetchedFromMemory & 0777777770) * (state.acc & 0777777770);
-      state.pq = (dummy >> 27LL) & 0777777776;
+      if (fetchData(hopStructure.dm, residual, hopStructure.ds, operand,
+          &fetchedFromMemory, &dataFromInstructionMemory))
+        goto done;
+      // The LVDC uses only 24 bits of the multiplicand and multitplier, so the
+      // 2 least significant bits are discarded.  (Assumes native 2's-complement.)
+      dummy = (convertDataWordToNative(fetchedFromMemory) & ~3)
+          * (convertDataWordToNative(state.acc) & ~3);
+      state.pq = convertNativeToDataWord(dummy / (1 << 25));
       if (op == 005)
-	cycleCount = 5;
-      break;
-    case 002:  // SUB
-      if (fetchData (hopStructure.dm, residual, hopStructure.dm, operand,
-		     &fetchedFromMemory, &dataFromInstructionMemory))
-	goto done;
-      state.acc = (state.acc - fetchedFromMemory) & 0777777776;
-      break;
-    case 003:  // DIV
-      // This operation divides a 26-bit value in the accumulator by a
-      // 24(?) bit value from memory, producing a 24-bit quotient in PQ.
-      // I left align the value from the accumulator in a 64-bit int first,
-      // to get the signs right.
-      dummy = state.acc;
-      dummy = dummy << 37;
-      if (fetchData (hopStructure.dm, residual, hopStructure.dm, operand,
-		     &fetchedFromMemory, &dataFromInstructionMemory))
-	goto done;
-      dummy /= (fetchedFromMemory & 0777777770) << 10;
-      state.pq = (dummy >> 10) & 0777777770;
-      break;
-    case 004:  // TNZ
+        cycleCount = 5;
+    }
+  else if (ptc && op == 001)
+    {
+      // PRS
+      // Within runOneInstruction(), we don't actually perform any actions on
+      // the basis of this instruction, other than to access the variable
+      // state.prs, and to set the variable state.prsChange to 1 to indicate
+      // that state.prs has been written to.  The calling code must
+      // interrogate these values in between instructions and take whatever
+      // larger action is required.
+      int data;
+      if (residual == 0 || (residual == 1 && operand <= 0373))
+        {
+          if (fetchData(hopStructure.dm, residual, hopStructure.ds, operand,
+              &fetchedFromMemory, &dataFromInstructionMemory))
+            goto done;
+          data = fetchedFromMemory;
+        }
+      else if (residual == 1 && operand == 0374)
+        {
+          // I don't really know what a "group mark word" is supposed to be,
+          // but in researching the BA8421 encoding, I found that the character
+          // 077 in BA421 _may_ be a group mark.
+          data = 077;
+        }
+      else if (residual == 1 && operand == 0375)
+        data = state.acc;
+      else
+        goto done;
+      state.prs = data;
+      state.prsChange = 1;
+    }
+  else if (ptc && op == 005)
+    {
+      // CIO
+      // Within runOneInstruction(), we don't actually perform any actions on
+      // the basis of this instruction, other than to access the array
+      // state.cio[], and to set the variable state.cioChange to indicate
+      // which array element (if any) has been written to.  The calling code must
+      // interrogate these values in between instructions and take whatever
+      // larger action is required.
+
+      // The following is based on Figure 2-11 in the PTC documentation.
+      if (operand == 0154 || operand == 0204 || operand == 0214
+          || operand == 0220)
+        state.acc = state.cio[operand];
+      else
+        {
+          state.cioChange = operand;
+          // Note that for many CIO operations, it is the operation itself which
+          // is significant, and not the specific info in ACC.  In other words,
+          // the instruction above is often sufficient, and the instruction below
+          // is often irrelevant.  However, there's no harm in the instruction
+          // below, so we can keep it in all cases.
+          state.cio[operand] = state.acc;
+        }
+    }
+  else if (op == 002)
+    {
+      // SUB
+      if (fetchData(hopStructure.dm, residual, hopStructure.ds, operand,
+          &fetchedFromMemory, &dataFromInstructionMemory))
+        goto done;
+      state.acc = convertNativeToDataWord(
+          convertDataWordToNative(state.acc)
+              - convertDataWordToNative(fetchedFromMemory));
+    }
+  else if (!ptc && op == 003)
+    {
+      // DIV
+      // We start by shifting the dividend as far left as possible, to insure
+      // that the quotient will have as many significant bits as possible.
+      // We'll shift the quotient down afterward to account for this.  The
+      // LVDC words are 26 bits, and we're using 64 bits for the intermediate
+      // values.
+      dummy = convertDataWordToNative(state.acc) * (1 << 28); // Scale ACC to 64 bits.
+      if (fetchData(hopStructure.dm, residual, hopStructure.ds, operand,
+          &fetchedFromMemory, &dataFromInstructionMemory))
+        goto done;
+      dummy /= convertDataWordToNative(fetchedFromMemory);
+      // The quotient will now be 2**28 too big, so must rescale it.  Also, the
+      // LVDC only has a 24-bit quotient, so the two least-significant bits
+      // are discarded.  (Assumes native 2's-complement arithmetic.)
+      state.pq = convertNativeToDataWord((dummy / (1 << 28)) & ~3); // Undo scaling.
+    }
+  else if (op == 004)
+    {
+      // TNZ
       if (state.acc != 0)
-	{
-	  nextLOC = operand;
-	  nextS = residual;
-	}
-      break;
-    case 006:  // AND
-      if (fetchData (hopStructure.dm, residual, hopStructure.dm, operand,
-		     &fetchedFromMemory, &dataFromInstructionMemory))
-	goto done;
+        {
+          nextLOC = operand;
+          nextS = residual;
+          state.lastHop = state.hop;
+        }
+    }
+  else if (op == 006)
+    {
+      // AND
+      if (fetchData(hopStructure.dm, residual, hopStructure.ds, operand,
+          &fetchedFromMemory, &dataFromInstructionMemory))
+        goto done;
       state.acc &= fetchedFromMemory;
-      break;
-    case 007:  // ADD
-      if (fetchData (hopStructure.dm, residual, hopStructure.dm, operand,
-		     &fetchedFromMemory, &dataFromInstructionMemory))
-	goto done;
-      state.acc = (state.acc + fetchedFromMemory) & 0777777776;
-      break;
-    case 010:  // TRA
+    }
+  else if (op == 007)
+    {
+      // ADD
+      if (fetchData(hopStructure.dm, residual, hopStructure.ds, operand,
+          &fetchedFromMemory, &dataFromInstructionMemory))
+        {
+          printf("Failed\n");
+          goto done;
+        }
+      state.acc = convertNativeToDataWord(
+          convertDataWordToNative(state.acc)
+              + convertDataWordToNative(fetchedFromMemory));
+    }
+  else if (op == 010)
+    {
+      // TRA
       nextLOC = operand;
       nextS = residual;
-      break;
-    case 011:  // XOR
-      if (fetchData (hopStructure.dm, residual, hopStructure.dm, operand,
-		     &fetchedFromMemory, &dataFromInstructionMemory))
-	goto done;
-      state.acc = (state.acc ^ fetchedFromMemory) & 0777777776;
-      break;
-    case 012:  // PIO
+      state.lastHop = state.hop;
+    }
+  else if ((!ptc && op == 011) || (ptc && op == 015))
+    {
+      // XOR
+      if (fetchData(hopStructure.dm, residual, hopStructure.ds, operand,
+          &fetchedFromMemory, &dataFromInstructionMemory))
+        goto done;
+      state.acc = state.acc ^ fetchedFromMemory;
+    }
+  else if (op == 012)
+    {
+      // PIO
+      // Within runOneInstruction(), we don't actually perform any actions on
+      // the basis of this instruction, other than to access the array
+      // state.pio[], and to set the variable state.pioChange to indicate
+      // which array element (if any) has been written to.  The calling code must
+      // interrogate these values in between instructions and take whatever
+      // larger action is required.
+
       // Determine direction of data flow.  If the least-significant 2 bits of
       // the operand are 11, then the data flows into the accumulator.
-      // Otherwise, the accumulator is the source of the data.
-      // Obviously, the operation involves more than simply manipulating the
-      // pio[] array's data, but that's a starting point.
+      // Otherwise, the accumulator or memory is the source of the data.
       if ((operand & 3) == 3)
-	{
-	  state.acc = state.pio[operand];
-	}
+        state.acc = state.pio[operand];
       else
-	{
-	  state.pio[operand] = state.acc;
-	}
-      break;
-    case 013:  // STO
-      storeData (hopStructure.dm, residual, hopStructure.dm, operand, state.acc,
-		 &dataOverwritesInstructionMemory);
-      break;
-    case 014:  // TMI
-      // Since the accumulator is only 27 bits, it won't fill the int32_t
+        {
+          state.pioChange = operand;
+          if (a8) // Source is the accumulator
+            state.pio[operand] = state.acc;
+          else // Source is memory.
+            {
+              if (fetchData(hopStructure.dm, residual, hopStructure.ds, operand, &fetchedFromMemory, &dataFromInstructionMemory))
+                fetchedFromMemory = 0;
+              state.pio[operand] = fetchedFromMemory;
+            }
+        }
+    }
+  else if (op == 013)
+    {
+      // STO
+      storeData(hopStructure.dm, residual, hopStructure.ds, operand, state.acc,
+          &dataOverwritesInstructionMemory);
+    }
+  else if (op == 014)
+    {
+      // TMI
+      // Since the accumulator is only 26 bits, it won't fill the int32_t
       // it's stored in, and hence we can't just check if it's negative.
       // However, it's stored in 2's-complement form, and if we assume that the
       // CPU running the emulator is also 2's-complement (which has been a good
       // assumption for at least the last 40 years), we can simply check its
-      // most-significant (27th) bit.
-      if ((state.acc & 0400000000) != 0)
-	{
-	  nextLOC = operand;
-	  nextS = residual;
-	}
-      break;
-    case 015:  // RSU
-      if (fetchData (hopStructure.dm, residual, hopStructure.dm, operand,
-		     &fetchedFromMemory, &dataFromInstructionMemory))
-	goto done;
-      state.acc = (fetchedFromMemory - state.acc) & 0777777776;
-      break;
-    case 016:  // CDS
+      // most-significant (26th) bit.
+      if ((state.acc & signMask) != 0)
+        {
+          nextLOC = operand;
+          nextS = residual;
+          state.lastHop = state.hop;
+        }
+    }
+  else if ((!ptc && op == 015) || (ptc && op == 003))
+    {
+      // RSU
+      if (fetchData(hopStructure.dm, residual, hopStructure.ds, operand,
+          &fetchedFromMemory, &dataFromInstructionMemory))
+        goto done;
+      state.acc = convertNativeToDataWord(
+          convertDataWordToNative(fetchedFromMemory)
+              - convertDataWordToNative(state.acc));
+    }
+  else if (ptc && op == 016 && a8 == 1)
+    {
+      // CDS
+      rawHopStructure.dm = (operand >> 4) & 1;
+      rawHopStructure.ds = operand & 017;
+#ifdef DEBUG_A_LOT
+      printf("CDS %o,%02o\n", rawHopStructure.dm, rawHopStructure.ds);
+#endif
+    }
+  else if (!ptc && op == 016 && a8 == 0 && a9 == 0)
+    {
+      // CDS
       rawHopStructure.dm = (operand >> 1) & 07;
       rawHopStructure.ds = (operand >> 4) & 017;
       rawHopStructure.dupdn = operand & 1;
-      break;
-    case 017:  // CLA
-      if (fetchData (hopStructure.dm, residual, hopStructure.dm, operand,
-		     &fetchedFromMemory, &dataFromInstructionMemory))
-	goto done;
-      state.acc = fetchedFromMemory;
-      break;
-    case 036:  // SHF
-      switch (operand)
-	{
-	case 000:
-	  state.acc = 0;
-	  break;
-	case 001:
-	  state.acc = state.acc >> 1;
-	  break;
-	case 002:
-	  state.acc = state.acc >> 2;
-	  break;
-	case 020:
-	  state.acc = state.acc << 1;
-	  break;
-	case 040:
-	  state.acc = state.acc << 2;
-	  break;
-	default:
-	  pushErrorMessage ("Illegal SHF instruction", NULL);
-	  goto done;
-	}
-      break;
-    case 076:  // EXM
-      {
-	const uint8_t locs[] =
-	  { 0200, 0240, 0300, 0340 };
-	int syllable;
-	uint8_t loc;
-	modOperand = operand & 017;
-	syllable = (operand >> 4) & 1;
-	loc = locs[(operand >> 5) & 3];
-	if (fetchInstruction (hopStructure.im, 1, hopStructure.is, syllable,
-			      loc, &instruction, &instructionFromDataMemory))
-	  goto done;
-	goto reenterForEXM;
-      }
-    default:
-      pushErrorMessage ("Implementation error", NULL);
-      goto done;
     }
-
-// Fix up state.hop and state.returnAddress for the next instruction.
-  rawHopStructure.loc = nextLOC;
-  rawHopStructure.s = nextS;
-  if (isHOP)
+  else if (ptc && op == 016 && a8 == 0)
     {
-      // state.hop has already been set, above.
-      if (formHopConstant (&rawHopStructure, &state.returnAddress))
-	goto done;
+      int direction = operand & 0100;
+      int sign = state.acc & signMask;
+#ifdef DEBUG_A_LOT
+      printf("Shift %03o\n", operand);
+#endif
+      if (direction)
+        {
+          switch (operand & 077)
+            {
+          case 001:
+            state.acc = sign | (state.acc >> 1);
+            break;
+          case 002:
+            state.acc = sign | (sign >> 1) | (state.acc >> 2);
+            break;
+          case 004:
+            state.acc = sign | (sign >> 1) | (sign >> 2) | (state.acc >> 3);
+            break;
+          case 010:
+            state.acc = sign | (sign >> 1) | (sign >> 2) | (sign >> 3)
+                | (state.acc >> 4);
+            break;
+          case 020:
+            state.acc = sign | (sign >> 1) | (sign >> 2) | (sign >> 3)
+                | (sign >> 4) | (state.acc >> 5);
+            break;
+          case 040:
+            state.acc = sign | (sign >> 1) | (sign >> 2) | (sign >> 3)
+                | (sign >> 4) | (sign >> 5) | (state.acc >> 6);
+            break;
+          default:
+            //pushErrorMessage("Illegal SHF instruction", NULL);
+            printf("Illegal SHF instruction\n");
+            goto done;
+            }
+        }
+      else
+        {
+          switch (operand & 077)
+            {
+          case 001:
+            state.acc = state.acc << 1;
+            break;
+          case 002:
+            state.acc = state.acc << 2;
+            break;
+          case 004:
+            state.acc = state.acc << 3;
+            break;
+          case 010:
+            state.acc = state.acc << 4;
+            break;
+          case 020:
+            state.acc = state.acc << 5;
+            break;
+          case 040:
+            state.acc = state.acc << 6;
+            break;
+          default:
+            //pushErrorMessage("Illegal SHF instruction", NULL);
+            printf("Illegal SHF instruction\n");
+            goto done;
+            }
+        }
+    }
+  else if (!ptc && op == 016 && a8 == 0 && a9 == 1)
+    {
+      // SHF
+      int sign = state.acc & signMask;
+      printf("Shift %03o\n", operand);
+      switch (operand)
+        {
+      case 000:
+        state.acc = 0;
+        break;
+      case 001:
+        state.acc = sign | (state.acc >> 1);
+        break;
+      case 002:
+        state.acc = sign | (sign >> 1) | (state.acc >> 2);
+        break;
+      case 020:
+        state.acc = state.acc << 1;
+        break;
+      case 040:
+        state.acc = state.acc << 2;
+        break;
+      default:
+        //pushErrorMessage("Illegal SHF instruction", NULL);
+        printf("Illegal SHF instruction\n");
+        goto done;
+        }
+    }
+  else if (!ptc && op == 016 && a8 == 1 && a9 == 1)
+    {
+      // EXM
+      const uint8_t locs[] =
+        { 0200, 0240, 0300, 0340 };
+      const uint8_t secs[] =
+        { 004, 014, 005, 015, 006, 016, 007, 017 };
+      int syllable, modBits, dsIndex;
+      uint8_t loc;
+      hopStructure_t pendingHop;
+      modBits = operand & 017;
+      syllable = (operand >> 4) & 1;
+      loc = locs[(operand >> 5) & 3];
+      if (fetchInstruction(hopStructure.dm, 017, syllable, locs[loc],
+          &instruction, &instructionFromDataMemory))
+        goto done;
+      dsIndex = (instruction >> 4) & 7;
+      instruction = (instruction & ~023) | modBits;
+      state.pendingEXM.pendingInstruction = instruction;
+      rawHopStructure.loc = nextLOC;
+      rawHopStructure.s = nextS;
+      if (formHopConstant(&rawHopStructure, &state.pendingEXM.nextHop))
+        goto done;
+      pendingHop.im = hopStructure.dm;
+      pendingHop.is = 017;
+      pendingHop.s = syllable;
+      pendingHop.loc = locs[loc];
+      pendingHop.dm = hopStructure.dm;
+      pendingHop.ds = secs[dsIndex];
+      pendingHop.dupdn = hopStructure.dupdn;
+      pendingHop.dupin = hopStructure.dupin;
+      if (formHopConstant(&pendingHop, &state.pendingEXM.pendingHop))
+        goto done;
+      state.pendingEXM.pending = 1;
+      // We're just going to jump back up to the start of this function
+      // to executed the modified instruction.  Because all the info
+      // for doing this is in the state.pendingEXM structure, we could
+      // instead exit the function normally and count on the parent code
+      // to just call runOneInstruction() again later.  The problem is
+      // that I'm not sure how all that affects stuff the parent code is
+      // doing (such as the debugger interface), so for right now I'm
+      // taking the simpler route of not returning until after the modified
+      // instruction is executed.  But if all the details were worked out,
+      // I think exiting the function normally would be better.
+      cycleCount++;
+      goto reenterForEXM;
+    }
+  else if (op == 017)
+    {
+      // CLA
+      if (fetchData(hopStructure.dm, residual, hopStructure.ds, operand,
+          &fetchedFromMemory, &dataFromInstructionMemory))
+        goto done;
+      state.acc = fetchedFromMemory;
     }
   else
     {
-      if (formHopConstant (&rawHopStructure, &state.hop))
-	goto done;
-      state.returnAddress = -2;
+      //pushErrorMessage("Implementation error", NULL);
+      printf("Implementation error\n");
+      runStepN = 0;
+      goto done;
     }
+
+  rawHopStructure.loc = nextLOC;
+  rawHopStructure.s = nextS;
+  if (!isHOP)
+    {
+      if (formHopConstant(&rawHopStructure, &state.hop))
+        goto done;
+    }
+  rawestHopStructure.loc++;
+  if (formHopConstant(&rawestHopStructure, &state.hopSaver))
+    state.hopSaver = -1;
 
   *cyclesUsed = cycleCount;
   retVal = 0;

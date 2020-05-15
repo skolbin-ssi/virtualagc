@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Ronald S. Burkey <info@sandroid.org>
+ * Copyright 2019-20 Ronald S. Burkey <info@sandroid.org>
  *
  * This file is part of yaAGC.
  *
@@ -16,20 +16,35 @@
  * along with yaAGC; if not, write to the Free Software
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  *
+ * In addition, as a special exception, Ronald S. Burkey gives permission to
+ * link the code of this program with the Orbiter SDK library (or with
+ * modified versions of the Orbiter SDK library that use the same license as
+ * the Orbiter SDK library), and distribute linked combinations including
+ * the two. You must obey the GNU General Public License in all respects for
+ * all of the code used other than the Orbiter SDK library. If you modify
+ * this file, you may extend this exception to your version of the file,
+ * but you are not obligated to do so. If you do not wish to do so, delete
+ * this exception statement from your version.
+ *
  * Filename:    yaLVDC.h
  * Purpose:     Common header for yaLVDC.c and friends.
  * Compiler:    GNU gcc.
  * Reference:   http://www.ibibio.org/apollo
  * Mods:        2019-09-18 RSB  Began.
+ *              2020-04-29 RSB  Added the --ptc switch.
  */
 
 #ifndef yaLVDC_h
 #define yaLVDC_h
 
 #include <stdint.h>
+#include <limits.h>
 
 ///////////////////////////////////////////////////////////////////////
 // Function prototypes and any global variables that go with them.
+
+// Length of an LVDC CPU's "computer cycle".
+#define SECONDS_PER_CYCLE (168.0/2048000) // About 82us.
 
 // See debug.c
 // (Note that debug.c relates to debugging yaLVDC and not to the
@@ -42,9 +57,8 @@
 // normal case after yaLVDC is fully developed.
 #define DEBUG_NONE		0
 #define DEBUG_SYMBOLS 		1
-#define DEBUG_SYMBOLS_BY_NAME 	2
-#define DEBUG_SOURCE_LINES 	4
-#define DEBUG_CORE		8
+#define DEBUG_SOURCE_LINES 	2
+#define DEBUG_CORE		4
 
 #define DEBUG_FLAGS DEBUG_NONE
 #if DEBUG_FLAGS != DEBUG_NONE
@@ -58,10 +72,55 @@ dPrintouts (void);
 #define dPrintouts()
 #endif
 
+// See yaLVDC.c
+int clockDivisor;
+int inhibitFetchMessages;
+#define MAX_SYMBOL_LENGTH 10
+typedef struct
+{
+  int temporary; // 0=permanent, 1=temporary.
+  int module;
+  int sector;
+  int syllable;
+  int location;
+  char name[MAX_SYMBOL_LENGTH];
+  int number;
+  int whichType;        // 0=name, 1=number, 2=address.
+} breakpoint_t;
+#define MAX_BREAKPOINTS 50
+breakpoint_t breakpoints[MAX_BREAKPOINTS];
+int numBreakpoints;
+
+typedef struct
+{
+  int32_t fromWhere;
+  int32_t toWhere;
+  unsigned long cycleCount;
+  unsigned long instructionCount;
+  int16_t fromInstruction;
+} backtrace_t;
+// A circular buffer for backtraces.  If firstEmptyBacktrace == firstUsedBacktrace,
+// then the buffer is empty, so it can hold up to MAX_BACKTRACES-1 entries.
+// When adding a new one, if the buffer is already full then the oldest one
+// is silently deleted.  Yes, it would be preferable instead of a circular buffer
+// to unroll as subroutines were returned from, but that's beyond my ability to
+// analyze, given the nature of the code.
+#define MAX_BACKTRACES 101
+backtrace_t backtraces[MAX_BACKTRACES];
+int firstUsedBacktrace, firstEmptyBacktrace;
+#define NEXT_BACKTRACE(n) (((n) + 1) % MAX_BACKTRACES)
+void
+addBacktrace(int16_t fromInstruction, int32_t fromWhere, int32_t toWhere,
+    unsigned long cycleCount, unsigned long instructionCount);
+
 // See parseCommandLineArguments.c
-#define MAX_PROGRAMS 5
-char *assemblyBasenames[MAX_PROGRAMS];
 char *coreFilename;
+int ptc;
+int coldStart;
+int runStepN; // # of emulation steps left to run until pausing. INT_MAX is unlimited.
+int inNextNotStep, inNextHop, inNextHopIM, inNextHopIS, inNextHopS,
+    inNextHopLOC;
+
 int
 parseCommandLineArguments(int argc, char *argv[]);
 
@@ -71,59 +130,91 @@ parseCommandLineArguments(int argc, char *argv[]);
 // cycle, because the emulator will periodically write it out to a persistence
 // file that will be reread at startup.  So if there's non-persistent state
 // stuff, it needs to be handled using some other mechanism than state_t.
-typedef struct {
+typedef struct
+{
+  int restart;
   int32_t hop;
   int32_t acc;
   int32_t pq;
-  int32_t returnAddress; // -2 except immediately after a HOP instruction.
+  int32_t hopSaver; // otherwise known as the "HOP saver" register.
   int32_t core[8][16][3][256];
-  int32_t pio[512];
+  int32_t pio[01000];
+  int32_t cio[01000]; // PTC only.
+  int32_t prs; // PTC only.
+  struct
+  {
+    int pending; // True or False, if last instruction was EXM or not.
+    int32_t nextHop; // HOP constant for next instruction (as if no pending EXM-modified instruction).
+    int32_t pendingHop; // HOP constant for the pending EXM-modified instruction.
+    int16_t pendingInstruction; // the EXM-modified instruction.
+  } pendingEXM; // LVDC only.
+  // The following three are reset at the start of a runOneInstruction()
+  // invocation, but changed if the associated pio[], cio[], or prs
+  // change during the runOneInstruction().  That's because
+  // runOneInstruction() itself does not do anything other than to change
+  // those values, without performed any of the explicit actions they're
+  // associated with in peripheral space, so it has to convey that some
+  // action is necessary by external code.
+  int pioChange;
+  int cioChange;
+  int prsChange;
+  // The following is normally -1, but is set by runOneInstruction()
+  // to the address of a HOP, TRA, TMI, or TNZ if it causes a jump
+  // to an instruction that's out of sequence.
+  int32_t lastHop;
+  int16_t lastInstruction;
 } state_t;
 state_t state;
-typedef struct {
-  char name[10];
+typedef struct
+{
+  char name[MAX_SYMBOL_LENGTH];
   uint8_t module;
   uint8_t sector;
   uint8_t syllable; // 0,1 instructions, 2 data.
   uint8_t loc;
 } symbol_t;
-symbol_t *symbols;
-symbol_t *symbolsByName;
-int numSymbols;
-int numSymbolsByName;
-typedef struct {
+typedef struct
+{
   char *line;
   uint8_t module;
   uint8_t sector;
   uint8_t syllable; // 0,1 instructions, 2 data.
   uint8_t loc;
+  int lineNumber;
+  uint16_t assembled;
+  uint8_t dm;
+  uint8_t ds;
 } sourceLine_t;
-sourceLine_t *sourceLines;
-int numSourceLines;
+#define MAX_ASSEMBLIES 16
+typedef struct
+{
+  char *name;
+  symbol_t *symbols;
+  int numSymbols;
+  sourceLine_t *sourceLines;
+  int numSourceLines;
+  int codeWords;
+  int dataWords;
+} assembly_t;
+assembly_t assemblies[MAX_ASSEMBLIES];
+int numAssemblies;
+int freezeAssemblies;
 int
-readAssemblies(char *assemblyNames[], int maxAssemblies);
+readAssemblies(void);
 int
-cmpSourceByAddress (const void *r1, const void *r2);
+cmpSourceByAddress(const void *r1, const void *r2);
 int
-cmpSymbolsByAddress (const void *r1, const void *r2);
-int
-cmpSymbolsByName (const void *r1, const void *r2);
-
-// See pushErrorMessage.c
-#define MAX_ERROR_MESSAGES 32
-char *errorMessageStack[MAX_ERROR_MESSAGES];
-int numErrorMessages;
-int
-pushErrorMessage (char *part1, char *part2);
+cmpSymbolsByAddress(const void *r1, const void *r2);
 
 // See readWriteCore.c
 int
-readCore (void);
+readCore(void);
 int
-writeCore (void);
+writeCore(void);
 
 // See runOneInstruction.c
-typedef struct {
+typedef struct
+{
   uint8_t im;
   uint8_t is;
   uint8_t s;
@@ -137,16 +228,46 @@ int instructionFromDataMemory;
 int dataFromInstructionMemory;
 int dataOverwritesInstructionMemory;
 int
-runOneInstruction (int *cyclesUsed);
+runOneInstruction(int *cyclesUsed);
 int
-parseHopConstant (int hopConstant, hopStructure_t *hopStructure);
+parseHopConstant(int hopConstant, hopStructure_t *hopStructure);
 int
-formHopConstant (hopStructure_t *hopStructure, int *hopConstant);
+formHopConstant(hopStructure_t *hopStructure, int *hopConstant);
 int
-fetchData (int module, int residual, int sector, int loc, int16_t *data,
-	   int *dataFromInstructionMemory);
+fetchData(int module, int residual, int sector, int loc, int32_t *data,
+    int *dataFromInstructionMemory);
 int
-storeData (int module, int residual, int sector, int loc, int16_t data,
-	   int *dataOverwritesInstructionMemory);
+storeData(int module, int residual, int sector, int loc, int32_t data,
+    int *dataOverwritesInstructionMemory);
+int
+fetchInstruction(int module, int sector, int syllable, int loc,
+    uint16_t *instruction, int *instructionFromDataMemory);
+
+// See gdbInterface.c
+int
+gdbInterface(unsigned long instructionCount, unsigned long cycleCount,
+    breakpoint_t *breakpoint);
+
+// See processInterruptsAndIO.c
+int
+processInterruptsAndIO(void);
+
+// See virtualWire.c
+#define MAX_LISTENERS 7
+int ServerBaseSocket;
+int PortNum;
+int virtualWireErrorCodes;
+int
+InitializeSocketSystem(void);
+void
+UnblockSocket(int SocketNum);
+int
+EstablishSocket(unsigned short portnum, int MaxClients);
+int
+CallSocket(char *hostname, unsigned short portnum);
+void
+connectCheck(void);
+int
+pendingVirtualWireActivity(void);
 
 #endif // yaLVDC_h

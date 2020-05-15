@@ -18,10 +18,7 @@
 #
 # Filename:    	yaASM.py
 # Purpose:     	An LVDC assembler, intended to replace yaASM.c for LVDC
-#              	(but not for OBC) assemblies.  It's actually just something
-#              	I'm playing around with to see if I can get something a
-#              	little cleaner and thus easier for me to maintain than yaASM.c, 
-#              	so I shouldn't really say I _intend_ it as a replacement.
+#              	(but not for OBC) assemblies. 
 # Reference:   	http://www.ibibio.org/apollo
 # Mods:        	2019-07-10 RSB  Began playing around with the concept.
 #		2019-08-14 RSB	Began working on this more seriously since
@@ -32,9 +29,15 @@
 #				auto-allocation of =... constants.
 #		2019-09-18 RSB	Now outputs .sym and .sch files in addition to
 #				the .tsv file that was already being output.
+#		2020-04-21 RSB	Began adding the --ptc command-line options
+#				along with --past-bugs and --help.
+#		2020-05-01 RSB	Added line number field to .src output file.
+#		2020-05-09 RSB	Added the assembled octals for the source lines
+#				to the .src file.  Needed by the debugger for
+#				detecting locations which have been changed by
+#				self-modifying code, and hence whose original
+#				source lines are no longer applicable.
 #
-# The usage is just
-#              yaASM.py [OCTALS.tsv] <INPUT.lvdc >OUTPUT.listing
 # Regardless of whether or not the assembly is successful, the following
 # additional files are produced at the end of the assembly process:
 #
@@ -85,14 +88,63 @@ from expression import *
 #----------------------------------------------------------------------------
 # Array for keeping track of which memory locations have been used already.
 used = [[[[False for offset in range(256)] for syllable in range(2)] for sector in range(16)] for module in range(8)]
-	
+
+# BA8421 character set in its native encoding.  All of the unprintable
+# characters are replaced by '?', which isn't a legal character anyway.
+# Used only for --ptc.
+BA8421 = [
+	' ', '1', '2', '3', '4', '5', '6', '7',
+	'8', '9', '0', '#', '@', '?', '?', '?',
+	'?', '/', 'S', 'T', 'U', 'V', 'W', 'X',
+	'Y', 'Z', '‡', ',', '(', '?', '?', '?',
+	'-', 'J', 'K', 'L', 'M', 'N', 'O', 'P',
+	'Q', 'R', '?', '$', '*', '?', '?', '?',
+	'+', 'A', 'B', 'C', 'D', 'E', 'F', 'G',
+	'H', 'I', '?', '.', ')', '?', '?', '?'
+]
+# EBCDIC-like character table.  The table has been massaged, and in particular 
+# shifted to a different numerical range, in such a way to as timake
+# it convenient for the purposes of this program, so it's not really EBCDIC
+# any longer.  Only the 0x40-0x7F and 0xC0-0xFF ranges have been reproduced.
+# They have been merged (with printable characters overriding unprintable ones) 
+# into a single 0x00-0x3F range.  All unprintable positions left over after 
+# that have been set to '!'.  I guess that it probably makes more sense to 
+# consider it as just a substitution table representing buggy original-assembler
+# printout, rather than thinking of it as EBCDIC at all, although there are 
+# entries in the table (deriving from EBCDIC) that are not actually used by
+# the assembler.  Used only for --ptc --past-bugs.
+EBCDIClike = [
+	'0', '1', '2', '3', '4', '5', '6', '7', 
+	'8', '9', '0', '!', '!', "'", '=', '"',
+	' ', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 
+	'H', 'I', '!', '.', ')', '(', '+', '!',
+	'&', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 
+	'Q', 'R', '!', '!', '*', ')', ';', '!',
+	' ', '/', 'S', 'T', 'U', 'V', 'W', 'X', 
+	'Y', 'Z', '!', ',', '(', '_', '>', '?'
+]
+# Characters which are printable in both BA8421 and EBCDIC.
+legalCharsBCI = set(BA8421).intersection(set(EBCDIClike))
+
+def bciPad(string):
+	while len(string) % 4 != 0:
+		string = string + " "
+	if string[-2:] != "  ":
+		string = string + "    "
+	return string
+
+# Some modifications to the following are made later,
+# after the command line arguments have been parsed
+# to detect presence or absence of --ptc.
 operators = {
     "HOP": { "opcode":0b0000 }, 
     "MPY": { "opcode":0b0001 }, 
+    "PRS": { "opcode":0b0001 }, 
     "SUB": { "opcode":0b0010 }, 
     "DIV": { "opcode":0b0011 }, 
     "TNZ": { "opcode":0b0100 }, 
     "MPH": { "opcode":0b0101 }, 
+    "CIO": { "opcode":0b0101 }, 
     "AND": { "opcode":0b0110 }, 
     "ADD": { "opcode":0b0111 },
     "TRA": { "opcode":0b1000 }, 
@@ -164,59 +216,145 @@ countOthers = 0
 countRollovers = 0
 
 checkFilename = ""
-if len(sys.argv) > 1:
-	try:
-		checkFilename = sys.argv[1]
-		f = open(checkFilename, "r")
-		module = -1
-		sector = -1
-		for line in f:
-			line = line.strip()
-			if line[:1] == "#" or len(line) == 0:
-				continue
-			fields = line.split("\t")
-			if len(fields) == 0:
-				continue
-			if fields[0] == "SECTOR":
-				module = int(fields[1], 8)
-				sector = int(fields[2], 8)
-				if module > 7 or sector > 15:
-					raise("Warning: module or sector out of range")
-				continue
-			offset = int(fields[0], 8)
-			ptr = 1
-			for count in range((len(fields) - 1) // 2):
-				if len(fields[ptr]) != 11:
-					raise("Warning: wrong field length")
-				elif fields[ptr].strip() == "" and fields[ptr + 1].strip() == "":
-					# An unused word.
-					pass
-				elif fields[ptr + 1] == "D" and fields[ptr][0] == " " and fields[ptr][-1] == " " and fields[ptr][1:-2].isdigit():
-					# A data word.
-					value = int(fields[ptr].strip(), 8)
-					octalsForChecking[module][sector][2][offset] = value
-				elif fields[ptr + 1] == "D" and (fields[ptr][:5] == "     " or fields[ptr][:5].isdigit()) \
-					and fields[ptr][5] == " " and (fields[ptr][6:] == "     " or fields[ptr][6:].isdigit()):
-					# An instruction-pair word.
-					syl1 = fields[ptr][:5]
-					syl0 = fields[ptr][6:]
-					if syl1.strip() != "":
-						value = int(syl1, 8)
-						octalsForChecking[module][sector][1][offset] = value
-					if syl0.strip() != "":
-						value = int(syl0, 8)
-						octalsForChecking[module][sector][0][offset] = value
+ptc = False
+pastBugs = False
+ignoreResiduals = False
+for arg in sys.argv[1:]:
+	if arg[:2] == "--":
+		if arg == "--ptc":
+			ptc = True
+		elif arg == "--past-bugs":
+			pastBugs = True
+		elif arg == "--ignore-residuals":
+			ignoreResiduals = True
+		elif arg == "--help":
+			print("Usage:", file=sys.stderr)
+			print("\tyaASM.py [OPTIONS] [OCTALS.tsv] <INPUT.lvdc >OUTPUT.listing", file=sys.stderr)
+			print("The OPTIONS are", file=sys.stderr)
+			print("\t--help -- to print this message.", file=sys.stderr)
+			print("\t--ptc -- to use PTC source/octal input rather than the default LVDC.", file=sys.stderr)
+			print("\t--past-bugs -- only with --ptc, reproduces some original assembler bugs.", file=sys.stderr)
+			print("\t--ignore-residuals -- (debug) for --ptc octal checks, ignore residual flag.", file=sys.stderr)
+			print("Files produced by the assembly are:", file=sys.stderr)
+			print("\tyaASM.tsv\tAn octal-listing file.", file=sys.stderr)
+			print("\tyaASM.sym\tA symbol file.", file=sys.stderr)
+			print("\tyaASM.src\tA source file.", file=sys.stderr)
+			sys.exit(0)
+		else:
+			print("Unknown command-line option " + arg, file=sys.stderr)
+			sys.exit(1)
+	else:
+		try:
+			checkFilename = arg
+			f = open(checkFilename, "r")
+			module = -1
+			sector = -1
+			offset = -1
+			for line in f:
+				line = line.strip()
+				if line[:1] == "#" or len(line) == 0:
+					continue
+				fields = line.split("\t")
+				if len(fields) == 0:
+					continue
+				if fields[0] == "SECTOR":
+					module = int(fields[1], 8)
+					sector = int(fields[2], 8)
+					if module > 7 or sector > 15:
+						raise("Warning: module or sector out of range (%o %02o)" % (module, sector))
+					continue
+				offset = int(fields[0], 8)
+				# Note that the format of the data lines from the input file differs
+				# depending on whether the file is based on the PAST program listing
+				# (PTC) or the AS206-RAM Flight Program listing (LVDC).
+				if ptc:
+					if len(fields) != 9:
+						raise("Warning: wrong number of fields (%d, must be 9)" % len(fields))
+					for n in range(1, 9):
+						entry = fields[n].strip()
+						if entry == "":
+							continue
+						if len(entry) != 12 or not entry.isdigit():
+							raise("Warning: octal value is corrupted (%s)" % entry)
+						value = int(entry, 8)
+						valid = value & 0o777
+						value = value >> 9
+						if valid > 3:
+							raise("Validity bits incorrect")
+						# Unfortunately, the PTC octal format cannot distinguish between
+						# data areas vs instruction areas as the LVDC octal format can,
+						# so we have to treat the octals as both.  While we can correctly
+						# deduce _some_ of that, we can't correctly deduce all of it, so
+						# we just have to rely on some fancier test logic farther down
+						# in the process.  (Specifically, if both syl0 and syl1 are valid,
+						# we can't tell if that's one data value or two instructions. I
+						# think all other cases are distinguishable.)
+						if valid != 3:
+							octalsForChecking[module][sector][2][offset] = None
+						else:
+							octalsForChecking[module][sector][2][offset] = value
+						syl1 = (value >> 12) & 0o77774
+						syl0 = value & 0o37776
+						if (valid & 2) == 0:
+							if syl1 != 0:
+								raise("Warning: syllable 2 should be 0 (%o %02o %03o)" % (module, sector, offset))
+							syl1 = None
+						if (valid & 1) == 0:
+							if syl0 != 0:
+								raise("Warning: syllable 1 should be 0 (%o %02o %03o)" % (module, sector, offset))
+							syl0 = None
+						octalsForChecking[module][sector][1][offset] = syl1
+						octalsForChecking[module][sector][0][offset] = syl0
+						offset += 1
 				else:
-					raise("Warning: unrecognized format: " + line)	
-				ptr += 2
-				offset += 1
-		f.close()
-		checkTheOctals = True
-	except:
-		countWarnings += 1
-		print("Warning: Cannot open octal-comparison file " + checkFilename + " or file is corrupted")
-		checkFilename = ""
+					ptr = 1
+					for count in range((len(fields) - 1) // 2):
+						if len(fields[ptr]) != 11:
+							raise("Warning: wrong field length")
+						elif fields[ptr].strip() == "" and fields[ptr + 1].strip() == "":
+							# An unused word.
+							pass
+						elif fields[ptr + 1] == "D" and fields[ptr][0] == " " and fields[ptr][-1] == " " and fields[ptr][1:-2].isdigit():
+							# A data word.
+							value = int(fields[ptr].strip(), 8)
+							octalsForChecking[module][sector][2][offset] = value
+						elif fields[ptr + 1] == "D" and (fields[ptr][:5] == "     " or fields[ptr][:5].isdigit()) \
+							and fields[ptr][5] == " " and (fields[ptr][6:] == "     " or fields[ptr][6:].isdigit()):
+							# An instruction-pair word.
+							syl1 = fields[ptr][:5]
+							syl0 = fields[ptr][6:]
+							if syl1.strip() != "":
+								value = int(syl1, 8)
+								octalsForChecking[module][sector][1][offset] = value
+							if syl0.strip() != "":
+								value = int(syl0, 8)
+								octalsForChecking[module][sector][0][offset] = value
+						else:
+							raise("Warning: unrecognized format: " + line)	
+						ptr += 2
+						offset += 1
+			f.close()
+			checkTheOctals = True
+		except:
+			countWarnings += 1
+			print("Warning (%o %02o %03o): Cannot open octal-comparison file %s or file is corrupted" % (module, sector, offset, checkFilename))
+			checkFilename = ""
 #print(octalsForChecking)
+if ptc:
+	del operators["MPY"]
+	del operators["MPH"]
+	del operators["DIV"]
+	del operators["EXM"]
+	operators["SHF"]["a9"] = 0
+	operators["SHL"]["a9"] = 0
+	operators["SHR"]["a9"] = 0
+	maxSHF = 6
+	operators["XOR"] = operators["RSU"].copy()
+	operators["RSU"]["opcode"] = 0b0011
+else:
+	del operators["PRS"]
+	del operators["CIO"]
+	maxSHF = 2
 
 # The following structures are used for tracking instructions transparently
 # inserted at the ends of syllable 1 of memory sectors by the assembler when
@@ -243,12 +381,24 @@ for n in range(8):
 lines = sys.stdin.readlines()
 for n in range(0,len(lines)):
 	lines[n] = lines[n].expandtabs().rstrip()
+	if ptc and 'BCI' in lines[n] and '^' in lines[n] and '$' in lines[n]:
+		# Convert all spaces within a BCI pseudo-op's operand to
+		# '_', so that the line can be parsed properly into
+		# fields later.  Any character not in the BA8421 character
+		# set could be used.
+		p = lines[n].index('BCI')
+		a = lines[n].index('^')
+		b = lines[n].index('$')
+		if p < a and a < b:
+			lines[n] = lines[n][:a] + lines[n][a:b].replace(' ', '_') + lines[n][b:]
 
 #----------------------------------------------------------------------------
 #	Definitions of utility functions
 #----------------------------------------------------------------------------
-def addError(n, msg):
+def addError(n, msg, trigger=-1):
 	global errors, countInfos, countWarnings, countErrors, countMismatches, countOthers
+	if trigger != -1 and trigger != n:
+		return
 	if msg not in errors[n]:
 		if msg[:5] == "Info:":
 			countInfos += 1
@@ -260,14 +410,15 @@ def addError(n, msg):
 			countMismatches += 1
 		else:
 			countOthers += 1
+		#msg = str(n) + ": " + msg
 		errors[n].append(msg) 
 
-def incDLOC(increment = 1):
+def incDLOC(increment = 1, mark = True):
 	global DLOC
 	global errors
 	while increment > 0:
 		increment -= 1
-		if DLOC < 256:
+		if DLOC < 256 and mark:
 			used[DM][DS][0][DLOC] = True
 			used[DM][DS][1][DLOC] = True
 		DLOC += 1
@@ -275,10 +426,8 @@ def incDLOC(increment = 1):
 # This function checks to see if a block of the desired size is 
 # available at the currently selected DM/DS/DLOC, and if not,
 # increments DLOC until it finds the space.
-def checkDLOC(increment = 1):
-	global DLOC
+def findDLOC(start = 0, increment = 1):
 	global errors
-	start = DLOC
 	n = start
 	length = 0
 	reuse = False
@@ -293,10 +442,14 @@ def checkDLOC(increment = 1):
 		n += 1
 		length += 1
 	if reuse:
-		addError(lineNumber, "Warning: Skipping memory locations already used")
+		addError(lineNumber, "Warning: Skipping memory locations already used (%o %02o %03o)" % (DM, DS, n))
 	if length < increment:
-		addError(lineNumber, "Error: No space of size " + str(increment) + " found in memory bank")
-	DLOC = start
+		addError(lineNumber, "Error: No space of size %d found in memory bank (%o %02o)" % (increment, DM, DS))
+	return start
+	
+def checkDLOC(increment = 1):
+	global DLOC
+	DLOC = findDLOC(start=DLOC, increment=increment)
 
 def incLOC():
 	global LOC
@@ -402,8 +555,15 @@ def convertNumericLiteral(n, isOctal = False):
 # Allocate/store a nameless variable for "=..." constant, returning its offset
 # into the sector, and a residual (0 if in sector specified or 1 if in residual
 # sector).
+# Later: Use has been extended, for --ptc, to automatic allocation of 
+# named variables from their implicit usage as operands in some instructions.
+# Still later:  No, automatic allocation of named variables for --ptc has to be done
+# earlier in the process than this, since if it's done here, the locations the
+# variables are supposed to go into have already been allocated.  Fortunately,
+# there's no code here that needs to be backed out.
+allocationRecords = []	# For debugging ordering of named and nameless allocationis.
 def allocateNameless(lineNumber, constantString, useResidual = True):
-	global nameless
+	global nameless, allocationRecords
 	value = "%o_%02o_%s" % (DM, DS, constantString)
 	if value in nameless:
 		return nameless[value],0
@@ -411,20 +571,31 @@ def allocateNameless(lineNumber, constantString, useResidual = True):
 		valueR = "%o_17_%s" % (DM, constantString)
 		if valueR in nameless:
 			return nameless[valueR],1
-	for loc in range(0, 256):
+	start = 0
+	for loc in range(start, 256):
 		if not used[DM][DS][0][loc] and not used[DM][DS][1][loc]:
-			#addError(lineNumber, "Info: Allocation of nameless " + value)
+			if False:
+				addError(lineNumber, "Info: Allocation of nameless " + value)
 			used[DM][DS][0][loc] = True
 			used[DM][DS][1][loc] = True
+			octals[DM][DS][2][loc] = 0
 			nameless[value] = loc
+			allocationRecords.append({ "symbol": value, "lineNumber":lineNumber, 
+				"inputLine": inputFile[lineNumber]["expandedLine"], 
+				"DM": DM, "DS": DS, "LOC": loc })
 			return loc,0
 	if useResidual and DS != 0o17:
-		for loc in range(0, 256):
+		for loc in range(start, 256):
 			if not used[DM][0o17][0][loc] and not used[DM][0o17][1][loc]:
-				#addError(lineNumber, "Info: Allocation of nameless " + valueR)
+				if False:
+					addError(lineNumber, "Info: Allocation of nameless " + valueR)
 				used[DM][0o17][0][loc] = True
 				used[DM][0o17][1][loc] = True
+				octals[DM][0o17][2][loc] = 0
 				nameless[valueR] = loc
+				allocationRecords.append({ "symbol": valueR, "lineNumber":lineNumber, 
+					"inputLine": inputFile[lineNumber]["expandedLine"], 
+					"DM": DM, "DS": DS, "LOC": loc })
 				return loc,1
 	addError(lineNumber, "Error: No remaining memory to store nameless constant (" + value + ")")
 	return 0,0
@@ -442,17 +613,19 @@ def checkLOC(extra = 0):
 	global S
 	global DLOC
 	global errors
+	if ptc and lastORG:
+		return []
 	if useDat:
 		# This is the "USE DAT" case. 
 		if DLOC >= 256:
 		 	addError(lineNumber, "Error: No room left in memory sector")
 		elif dS == 1 and (used[DM][DS][0][DLOC] or used[DM][DS][1][DLOC]):
 			tLoc = DLOC
-			addError(lineNumber, "Warning: Skipping memory locations already used")
+			addError(lineNumber, "Warning: Skipping memory locations already used (%o %02o %03o)" % (DM, DS, DLOC))
 			while tLoc < 256 and dS == 1 and (used[DM][DS][0][tLoc] or used[DM][DS][1][tLoc]):
 				tLoc += 1
 			if tLoc >= 256:
-				addError(lineNumber, "Error: No room left in memory sector")
+				addError(lineNumber, "Error: No room left in memory sector (%o %02o)" % (DM, DS))
 			else:
 				DLOC = tLoc
 				return []
@@ -471,7 +644,7 @@ def checkLOC(extra = 0):
 			# to find address for the TRA or HOP to take us to, always searching
 			# upward.
 			if lastORG:
-				addError(lineNumber, "Warning: Skipping memory locations already used")
+				addError(lineNumber, "Warning: Skipping memory locations already used (%o %02o %o %03o)" % (IM, IS, S, LOC + 1))
 			else:
 				used[IM][IS][S][LOC] = True
 				autoSwitch = True
@@ -511,7 +684,8 @@ def checkLOC(extra = 0):
 # Disassembles the two syllables of a word into instructions.  Useful only for debugging
 # DFW pseudo-ops, and now that DFW is working properly, I've actually commented its use out.  
 # However, I like the function definition, so I'll leave it here for a while in case I think
-# of something else to use it for.  The code was adapted from unOP.py.
+# of something else to use it for.  The code was adapted from unOP.py.  It has not been 
+# adapted yet for --ptc.
 def unassemble(word):
 	instructions = [ "HOP", "MPY", "SUB", "DIV", "TNZ", "MPH", "AND", "ADD", "TRA", "XOR", "PIO", "STO", "TMI", "RSU", "", "CLA" ]
 	syllables = [(word & 0o777740000) >> 13 , word & 0o37776]
@@ -566,7 +740,10 @@ def storeAssembled(lineNumber, value, hop, data = True):
 		sector = hop["DS"]
 		location = hop["DLOC"]
 		checkSyl = 2
-		octals[module][sector][2][location] = value
+		try:
+			octals[module][sector][2][location] = value
+		except:
+			addError(lineNumber, "Error: Invalid data address %o-%02o-%03o." % (module, sector, location))
 	else:
 		module = hop["IM"]
 		sector = hop["IS"]
@@ -590,26 +767,39 @@ def storeAssembled(lineNumber, value, hop, data = True):
 			else:
 				octals[module][sector][syllable][location] = (value << 1) & 0o37776
 	if checkTheOctals and checkSyl >= 0:
-		if octals[module][sector][checkSyl][location] != octalsForChecking[module][sector][checkSyl][location]:
+		assembledOctal = octals[module][sector][checkSyl][location]
+		checkOctal = octalsForChecking[module][sector][checkSyl][location]
+		if assembledOctal != checkOctal:
 			msg = "Mismatch: Octal mismatch, "
-			if checkSyl == 2:
-				fmt = "%09o != %09o, xor = %09o" 
+			xor = 0
+			if checkOctal == None:
+				if checkSyl == 2:
+					fmt = "%o,%02o,%o,%03o, %09o != None" 
+				else:
+					fmt = "%o,%02o,%o,%03o, %05o != None"
+				msg += fmt % (module, sector, checkSyl, location, assembledOctal)
 			else:
-				fmt = "%05o != %05o, xor = %05o"
-			xor = octals[module][sector][checkSyl][location] ^ octalsForChecking[module][sector][checkSyl][location]
-			msg += fmt % (octals[module][sector][checkSyl][location], octalsForChecking[module][sector][checkSyl][location], xor)
-			#msg += ", disassembly   " + unassemble(octals[module][sector][checkSyl][location])
-			#msg += "   !=   " + unassemble(octalsForChecking[module][sector][checkSyl][location])
-			addError(lineNumber, msg)
+				if checkSyl == 2:
+					fmt = "%o,%02o,%o,%03o, %09o != %09o, xor = %09o" 
+				else:
+					fmt = "%o,%02o,%o,%03o, %05o != %05o, xor = %05o"
+				xor = assembledOctal ^ checkOctal
+				msg += fmt % (module, sector, checkSyl, location, assembledOctal, checkOctal, xor)
+				#msg += ", disassembly   " + unassemble(assembledOctal)
+				#msg += "   !=   " + unassemble(checkOctal)
+			if not (ptc and ignoreResiduals and ((checkSyl == 0 and xor == 0o100) or (checkSyl == 1 and xor == 0o100))):
+				addError(lineNumber, msg)
 
 # Form a HOP constant from a hop dictionary.
 def formConstantHOP(hop):
 	hopConstant = 0
 	hopConstant |= (hop["IM"] & 1) << 25
-	hopConstant |= 1 << 24
+	if not ptc:
+		hopConstant |= 1 << 24
 	hopConstant |= hop["DS"] << 20
 	hopConstant |= hop["DM"] << 17
-	hopConstant |= 1 << 16
+	if not ptc:
+		hopConstant |= 1 << 16
 	hopConstant |= hop["LOC"] << 7
 	hopConstant |= hop["S"] << 6
 	hopConstant |= hop["IS"] << 2
@@ -711,7 +901,11 @@ for n in range(0, len(lines)):
 		expandedLines[-1] = []
 	elif len(fields) >= 3 and fields[0] != "" and fields[1] in ["DEQD", "DEQS"]:
 		constants[fields[0]] = [fields[1]] + fields[2].split(",")
-	elif len(fields) >= 3 and fields[1] == "CDS" and fields[2] in constants and type(constants[fields[2]]) == type([]) and len(constants[fields[2]]) >= 3:
+	elif ptc and len(fields) >= 3 and fields[1] == "CDS" and 2 == len(fields[2].split(",")):
+		subfields = fields[2].split(",")
+		line = "%-8s%-8s%s" % (fields[0], fields[1], "%s,%s" % (subfields[0], subfields[1]))
+		expandedLines[n] = [line]
+	elif (not ptc) and len(fields) >= 3 and fields[1] == "CDS" and fields[2] in constants and type(constants[fields[2]]) == type([]) and len(constants[fields[2]]) >= 3:
 		constant = constants[fields[2]]
 		op = fields[1]
 		if constant[0] == "DEQS":
@@ -747,9 +941,9 @@ for n in range(0, len(lines)):
 			expandedLines[n].append("%-8s%-8s0" % (thisLabel, operator))
 		else:
 			while count > 0:
-				thisCount = 2
+				thisCount = maxSHF
 				if thisCount > count:
-					thisCount = 1
+					thisCount = count
 				expandedLines[n].append("%-8s%-8s%d" % (thisLabel, operator, thisCount))
 				thisLabel = ""
 				count -= thisCount
@@ -847,19 +1041,38 @@ if False:
 #----------------------------------------------------------------------------
 # The object of this pass is to discover all addresses for left-hand symbols,
 # or in other words, to assign an address (HOP constant) to each line of code.
-# As far as I know right now, it looks like we can do this in a single pass.   
+  
 # The result of the pass is a hopefully easy-to-understand dictionary called 
 # inputFile. It also buffers the lhs, operator, and operand fields, so they 
 # don't have to be parsed out again on the next pass.
 
-# For this pass, we can just loop through all of the lines of code by having an 
-# outer loop on all of the elements of expandedLines[], and an inner loop on all 
-# of the elements of expandedLines[n][].
+# For either discovery pass, we can just loop through all of the lines of code by 
+# having an outer loop on all of the elements of expandedLines[], and an inner 
+# loop on all of the elements of expandedLines[n][].
 
+page = 0
+ptcDLOC = [[1 for sector in range(16)] for module in range(8)]
+IM = 0
+IS = 0
+S = 1
+LOC = 0
+DM = 0
+DS = 0
+dS = 0
+DLOC = 0
+useDat = False
+udDM = 0
+udDS = 0
+tempSymbols = []
 for lineNumber in range(0, len(expandedLines)):
 	for line in expandedLines[lineNumber]:
+		if ptc:
+			ptcDLOC[DM][DS] = DLOC
+		lFields = line.split()
+		if len(lFields) >= 3 and lFields[0] == "#" and lFields[1] == "PAGE" and lFields[2][:-1].isdigit():
+			page = int(lFields[2][:-1])
 		inDataMemory = True
-		inputLine = { "raw": line, "VEC": False, "MAT": False, "numExpanded": len(expandedLines[lineNumber]) }
+		inputLine = { "raw": line, "VEC": False, "MAT": False, "numExpanded": len(expandedLines[lineNumber]), "page": page }
 		isCDS = False
 		    
 		# Split the line into fields.
@@ -916,7 +1129,7 @@ for lineNumber in range(0, len(expandedLines)):
 				if fields[0] in forms:
 					addError(n, "Error: Form already defined")
 				forms[fields[0]] = ofields
-			elif fields[1] == "ORGDD":
+			elif (not ptc) and fields[1] == "ORGDD":
 				lastORG = True
 				if len(ofields) != 7:
 					addError(lineNumber, "Error: Wrong number of ORGDD arguments")
@@ -927,25 +1140,72 @@ for lineNumber in range(0, len(expandedLines)):
 					LOC = int(ofields[3], 8)
 					DM = int(ofields[4], 8)
 					DS = int(ofields[5], 8)
-					if ofields[6] != "":
+					if ofields[6].strip() != "":
 						DLOC = int(ofields[6], 8)
 					else:
 						DLOC = 0
-			elif fields[1] == "DOGD":
-				if len(ofields) != 3:
-					addError(lineNumber, "Error: Wrong number of DOGD arguments")
+					inputLine["udDM"] = DM
+					inputLine["udDS"] = DS
+			elif ptc and fields[1] == "ORG":
+				lastORG = True
+				if len(ofields) != 7:
+					addError(lineNumber, "Error: Wrong number of ORG arguments")
 				else:
-					DM = int(ofields[0], 8)
-					DS = int(ofields[1], 8)
-					if ofields[2] != "":
+					if ofields[0].strip() != "":
+						IM = int(ofields[0], 8)
+					else:
+						IM = 0
+					if ofields[1].strip() != "":
+						IS = int(ofields[1], 8)
+					else:
+						IS = 0
+					if ofields[2].strip() != "":
+						S = int(ofields[2], 8)
+					else:
+						S = 0
+					if ofields[3].strip() != "":
+						LOC = int(ofields[3], 8)
+					else:
+						LOC = 0
+					if ofields[4].strip() != "":
+						DM = int(ofields[4], 8)
+					else:
+						DM = 0
+					if ofields[5].strip() != "":
+						DS = int(ofields[5], 8)
+					else:
+						DS = 0
+					if ofields[6].strip() != "":
+						DLOC = int(ofields[6], 8)
+					else:
+						DLOC = ptcDLOC[DM][DS]
+			elif (fields[1] == "DOGD" and not ptc) or (fields[1] == "DOG" and ptc):
+				if len(ofields) != 3:
+					addError(lineNumber, "Error: Wrong number of DOGD/DOG arguments")
+				else:
+					if ofields[0].strip() != "":
+						DM = int(ofields[0], 8)
+					else:
+						DM = 0
+					if ofields[1].strip() != "":
+						DS = int(ofields[1], 8)
+					else:
+						DS = 0
+					if ofields[2].strip() != "":
 						DLOC = int(ofields[2], 8)
+					elif ptc:
+						DLOC = ptcDLOC[DM][DS]
 					else:
 						DLOC = 0
+				inputLine["udDM"] = DM
+				inputLine["udDS"] = DS
 			elif fields[1] in ["DEQS", "DEQD"] and fields[0] in constants:
 				symbols[fields[0]] = {	"IM":IM, "IS":IS, "S":S, 
 								"LOC":LOC, "DM":int(constants[fields[0]][1], 8), 
 								"DS":int(constants[fields[0]][2], 8), 
 								"DLOC":DLOC, "inDataMemory":True }
+				inputLine["udDM"] = int(constants[fields[0]][1], 8)
+				inputLine["udDS"] = int(constants[fields[0]][2], 8)
 			elif fields[1] == "BSS":
 				checkDLOC(int(fields[2]))
 				if fields[0] != "":
@@ -954,6 +1214,16 @@ for lineNumber in range(0, len(expandedLines)):
 				inputLine["operand"] = fields[2]
 				inputLine["hop"] = {"IM":DM, "IS":DS, "S":0, "LOC":DLOC, "DM":DM, "DS":DS, "DLOC":DLOC}
 				incDLOC(int(fields[2]))
+			elif ptc and fields[1] == "BCI":
+				text = bciPad(fields[2][1:-1])
+				textLength = len(text) / 4
+				checkDLOC(textLength)
+				if fields[0] != "":
+					inputLine["lhs"] = fields[0]
+				inputLine["operator"] = fields[1]
+				inputLine["operand"] = fields[2]
+				inputLine["hop"] = {"IM":DM, "IS":DS, "S":0, "LOC":DLOC, "DM":DM, "DS":DS, "DLOC":DLOC}
+				incDLOC(textLength)
 			elif fields[1] in ["DEC", "OCT", "HPC", "HPCDD", "DFW"] or fields[1] in forms:
 				checkDLOC()
 				if fields[0] != "":
@@ -964,12 +1234,23 @@ for lineNumber in range(0, len(expandedLines)):
 				incDLOC()	
 			elif fields[1] in operators:
 				inDataMemory = False
-				extra = 0
-				if fields[2][:2] == "*+" and fields[2][2:].isdigit():
-					extra = int(fields[2][2:])
-				oldLocation = checkLOC(extra)
-				if oldLocation != []:
-					inputLine["switchSectorAt"] = oldLocation
+				if True:
+					# This code is intended for inserting extra jumps around memory
+					# already allocated for something else.  I don't see how it could
+					# be effective here in the discovery pass, because some of the 
+					# memory it's trying to jump around won't have been allocated yet. 
+					# Nevertheless, it seems to work for LVDC AS206-RAM, and fails
+					# sometimes for PTC PAST program.  Perhaps the AS206-RAM program
+					# just by chance avoids the problematic situations.
+					extra = 0
+					if fields[2][:2] == "*+" and fields[2][2:].isdigit():
+						extra = int(fields[2][2:])
+					if ptc and fields[1] in ["TRA", "HOP"] and not used[IM][IS][S][LOC]:
+						pass
+					else:
+						oldLocation = checkLOC(extra)
+						if oldLocation != []:
+							inputLine["switchSectorAt"] = oldLocation
 				lastORG = False
 				if fields[0] != "":
 					inputLine["lhs"] = fields[0]
@@ -991,6 +1272,8 @@ for lineNumber in range(0, len(expandedLines)):
 				else:
 					inputLine["hop"] = {"IM":IM, "IS":IS, "S":S, "LOC":LOC, "DM":DM, "DS":DS, "DLOC":DLOC}
 				incLOC()
+				if ptc and "incDLOC" in inputLine:
+					incDLOC(mark = False)
 				if fields[1] in ["CDS", "CDSD", "CDSS"]:
 					# I should be doing something here with the simplex vs duplex info, but I don't
 					# know what, so I'll just ignore it for now.
@@ -1003,8 +1286,11 @@ for lineNumber in range(0, len(expandedLines)):
 								constant = constants[fields[2]]
 								if type(constant) == type([]) and len(constant) >= 3:
 									#print(constant[1] + " " + constant[2])
-									DM = int(constant[1], 8)
-									DS = int(constant[2], 8)
+									if not useDat:
+										DM = int(constant[1], 8)
+										DS = int(constant[2], 8)
+									inputLine["udDM"] = int(constant[1], 8)
+									inputLine["udDS"] = int(constant[2], 8)
 									found = True
 							# We assume this is the name of a variable, and we have to
 							# find it to determine its DM/DS.  I presume it could be
@@ -1014,11 +1300,17 @@ for lineNumber in range(0, len(expandedLines)):
 									testLine = testEntry["expandedLine"]
 									if "lhs" in testLine and testLine["lhs"] == fields[2] and "hop" in testLine:
 										if fields[1] == "CDSD":
-											DM = testLine["hop"]["DM"]
-											DS = testLine["hop"]["DS"]
+											if not useDat:
+												DM = testLine["hop"]["DM"]
+												DS = testLine["hop"]["DS"]
+											inputLine["udDM"] = testLine["hop"]["DM"]
+											inputLine["udDS"] = testLine["hop"]["DS"]
 										elif fields[1] == "CDS":
-											DM = testLine["hop"]["IM"]
-											DS = testLine["hop"]["IS"]
+											if not useDat:
+												DM = testLine["hop"]["IM"]
+												DS = testLine["hop"]["IS"]
+											inputLine["udDM"] = testLine["hop"]["IM"]
+											inputLine["udDS"] = testLine["hop"]["IS"]
 										found = True
 										break
 							if not found:
@@ -1026,8 +1318,13 @@ for lineNumber in range(0, len(expandedLines)):
 					elif len(ofields) != 2:
 						addError(lineNumber, "Error: Wrong number of CDS/CDSD arguments")
 					elif not useDat:
-						DM = int(ofields[0], 8)
-						DS = int(ofields[1], 8)
+						if not useDat:
+							DM = int(ofields[0], 8)
+							DS = int(ofields[1], 8)
+						inputLine["udDM"] = int(ofields[0], 8)
+						inputLine["udDS"] = int(ofields[1], 8)
+					if ptc:
+						DLOC = ptcDLOC[DM][DS]
 			elif fields[1] in preprocessed:
 				pass
 			elif fields[1] in pseudos:
@@ -1039,6 +1336,8 @@ for lineNumber in range(0, len(expandedLines)):
 		inputLine["inDataMemory"] = inDataMemory
 		inputLine["useDat"] = useDat
 		inputLine["isCDS"] = isCDS
+		if ptc and "lhs" in inputLine:
+			tempSymbols.append(inputLine["lhs"])
 		inputFile.append({"lineNumber":lineNumber, "expandedLine":inputLine })
 
 # Create a table to quickly look up addresses of symbols.
@@ -1046,15 +1345,31 @@ for entry in inputFile:
 	inputLine = entry["expandedLine"]
 	lineNumber = entry["lineNumber"]
 	if "lhs" in inputLine:
+		lhs = inputLine["lhs"]
 		if "hop" in inputLine:
-			lhs = inputLine["lhs"]
 			if lhs in symbols:
 				addError(lineNumber, "Error: Symbol already defined")
 			symbols[lhs] = inputLine["hop"]
 			symbols[lhs]["inDataMemory"] = inputLine["inDataMemory"]
 			symbols[lhs]["isCDS"] = inputLine["isCDS"]
+			if inputLine["inDataMemory"]:
+				allocationRecords.append({ "symbol": lhs, "lineNumber": lineNumber, 
+					"inputLine": inputLine, "DM": inputLine["hop"]["DM"], 
+					"DS": inputLine["hop"]["DS"], "LOC": inputLine["hop"]["LOC"] })
 		else:
-			addError(lineNumber, "Error: Symbol location unknown")
+			addError(lineNumber, "Error: Symbol location unknown (%s)" % lhs)
+	if "autoVariable" in inputLine:
+		autoVariable = inputLine["autoVariable"]
+		if "hop" in inputLine:
+			symbols[autoVariable] = inputLine["hop"]
+			symbols[autoVariable]["inDataMemory"] = True
+			symbols[autoVariable]["isCDS"] = False
+			addError(lineNumber, "Info: Auto-allocation of variable %s" % autoVariable)
+			allocationRecords.append({ "symbol": autoVariable, "lineNumber": lineNumber, 
+				"inputLine": inputLine, "DM": inputLine["hop"]["DM"], 
+				"DS": inputLine["hop"]["DS"], "LOC": inputLine["hop"]["DLOC"] })
+		else:
+			addError(lineNumber, "Error: Symbol location unknown (%s)" % autoVariable)
 
 # A mini-pass to set up SYN symbols.
 for n in range(0, len(lines)):
@@ -1099,6 +1414,8 @@ if False:
 #   1.  Operands of the form "=something"
 #   2.  Operands of HOP*, TRA*.
 #   3.  Targets of HOPs transparently added for automatic sector changes.
+#   4.  For --ptc, variables used as operands of instructions but not explicitly 
+#       allocated.
 # Note that the discovery pass should have already taken care of TMI*
 # and TNZ*, even though unable to take care of HOP*.  Now, though, we should
 # have all of the info need to allocate those during assembly pass,
@@ -1127,7 +1444,82 @@ f = open("yaASM.src", "w")
 if False:
 	for key in sorted(nameless):
 		print(key + " " + ("%03o" % nameless[key]))
-header = "    IM IS S LOC DM DS  A8-A1 A9 OP  CONSTANT    SOURCE STATEMENT"
+if ptc:
+	lineFieldFormats = [ "%1s", "   %2s ", "%2s ", "%1s ", "%03s    ", "%02s ", "%2s ", "%02s ", "%1s ", "%03s    ", "%9s  ", "%1s ", "%s" ]
+	header = "    IM IS S LOC    OP DM DS 9 ADR     OCT VAL     LHS     OPC     VARIABLE                COMMENT"
+	traField = 0
+	imField = 1
+	isField = 2
+	sylField = 3
+	locField = 4
+	opField = 5
+	dmField = 6
+	dsField = 7
+	a9Field = 8
+	adrField = 9
+	constantField = 10
+	expansionField = 11
+	rawField = 12
+else:
+	lineFieldFormats = [ "%1s", "   %2s ", "%02s ", "%1s ", "%03s ", "%2s ", "%02s   "," %03s  ", "%1s  ", "%02s    ", "%09s ", "%1s ", "%s"]
+	header = "    IM IS S LOC DM DS   A8-A1 A9 OP    CONSTANT    SOURCE STATEMENT"
+	traField = 0
+	imField = 1
+	isField = 2
+	sylField = 3
+	locField = 4
+	dmField = 5
+	dsField = 6
+	adrField = 7
+	a9Field = 8
+	opField = 9
+	constantField = 10
+	expansionField = 11
+	rawField = 12
+lineFields = []
+def clearLineFields():
+	global lineFields
+	lineFields = []
+	for n in range(len(lineFieldFormats)):
+		lineFields.append("")
+def printLineFields():
+	line = ""
+	for n in range(len(lineFieldFormats)):
+		#print('"' + lineFieldFormats[n] + '" "' + lineFields[n] + '"')
+		line += lineFieldFormats[n] % lineFields[n]
+	print(line)
+
+# Determine if module dm, sector ds is reachable from the global 
+# module DM, sector DS.  Return True if so, False if not.
+def inSectorOrResidual(dm, ds, DM, DS, useDat, udDM, udDS):
+	if useDat:
+		# I'm having no luck trying to figure this out for USE DATA
+		# sections, so for now I just let the test pass.
+		return True
+		addError(lineNumber, "%o %02o, %o %02o, %o %02o" % (dm, ds, DM, DS, udDM, udDS))
+		DM = udDM
+		DS = udDS
+	if ptc:
+		if dm == 0 and ds == 0o17:
+			return True
+		if dm == DM and ds == DS:
+			return True
+	else:
+		if dm == DM and (ds == DS or ds == 0o17):
+			return True
+	return False
+
+# Determine if module dm, sector ds is the residual sector
+# based on the current DM, DS.
+def residualBit(dm, ds):
+	if ptc:
+		if dm == 0 and ds == 0o17 and not (DM == 0 and DS == 0o17):
+			return 1
+	else:
+		if dm == DM and ds == 0o17: # and DS != 0o17:
+			return 1 
+	return 0
+
 useDat = False
 errorsPrinted = []
 lastLineNumber = -1
@@ -1139,9 +1531,14 @@ for entry in inputFile:
 	errorList = errors[lineNumber]
 	originalLine = lines[lineNumber]
 	constantString = ""
+	clearLineFields()
 	star = False
 	if originalLine[:7] == "# PAGE ":
 		print("\f")
+	if "udDM" in inputLine:
+		udDM = inputLine["udDM"]
+	if "udDS" in inputLine:
+		udDS = inputLine["udDS"]
 	
 	# If the line is expanded by the preprocessor, we have to display its unexpanded form
 	# before proceeding.
@@ -1151,7 +1548,9 @@ for entry in inputFile:
 			expansionMarker = " "
 		else:
 			expansionMarker = "+"
-			print(("%40s" % "") + "\t" + originalLine)
+			lineFields[rawField] = originalLine
+			printLineFields()
+			clearLineFields()
 			
 	# If there's an automatic sector switch here, we have to take care of it prior to
 	# doing anything with the instruction that's actually associated with this line.
@@ -1194,11 +1593,19 @@ for entry in inputFile:
 				"DLOC": loc
 			}, True)
 		storeAssembled(lineNumber, assembled, {"IM":im0, "IS":is0, "S":s0, "LOC":loc0}, False)
-		line = "*    %o %02o %o %03o  %o %02o  " % (im0, is0, s0, 
-							loc0, inputLine["hop"]["DM"], inputLine["hop"]["DS"])
-		print(line + " " + a81 + "  " + a9 + "  " + op + "  " + ("%9s" % constantString))
+		lineFields[traField] = "*"
+		lineFields[imField] = "%2o" % im0
+		lineFields[isField] = "%02o" % is0
+		lineFields[sylField] = "%1o" % s0
+		lineFields[locField] = "%03o" % loc0
+		lineFields[dmField] = "%2o" % inputLine["hop"]["DM"]
+		lineFields[dsField] = "%02o" % inputLine["hop"]["DS"]
+		lineFields[opField] = op
+		lineFields[a9Field] = a9
+		lineFields[adrField] = a81
+		lineFields[constantField] = "%9s" % constantString
+		printLineFields()
 		constantString = ""
-	
 	operator = ""
 	if "operator" in inputLine:
 		operator = inputLine["operator"]
@@ -1236,19 +1643,35 @@ for entry in inputFile:
 		S = hop["S"]
 		LOC = hop["LOC"]
 		if "useDat" in inputLine and inputLine["useDat"]:
-			line = "      %o %03o  %o %02o  " % (hop["S"], hop["DLOC"], hop["DM"], hop["DS"])
+			lineFields[sylField] = "%1o" % S
+			lineFields[locField] = "%03o" % DLOC
+			lineFields[dmField] = "%2o" % DM
+			lineFields[dsField] = "%02o" % DS
+			lineFields[adrField] = "%03o" % DLOC
 		elif operator in ["DEC", "OCT", "DFW", "BSS", "HPC", "HPCDD"] or operator in forms:
-			line = "        %03o  %o %02o  " % (hop["DLOC"], hop["DM"], hop["DS"])
+			if ptc:
+				lineFields[adrField] = "%03o" % DLOC
+			else:
+				lineFields[locField] = "%03o" % DLOC
+			lineFields[dmField] = "%2o" % DM
+			lineFields[dsField] = "%02o" % DS
 		elif operator in ["CDS", "CDSS", "CDSD", "SHL", "SHR", "SHF"]:
-			line = " %o %02o %o %03o        " % (hop["IM"], hop["IS"], hop["S"], hop["LOC"])
+			lineFields[imField] = "%2o" % IM
+			lineFields[isField] = "%02o" % IS
+			lineFields[sylField] = "%1o" % S
+			lineFields[locField] = "%03o" % LOC
+			if ptc:
+				lineFields[dmField] = "%2o" % DM
+				lineFields[dsField] = "%02o" % DS
 		elif operator in ["DEQD", "DEQS"]:
-			line = "                   "
+			pass
 		else:
-			line = " %o %02o %o %03o  %o %02o  " % (hop["IM"], hop["IS"], hop["S"], 
-								hop["LOC"], hop["DM"], hop["DS"])
-	else:
-		line = "                   "
-	
+			lineFields[imField] = "%2o" % IM
+			lineFields[isField] = "%02o" % IS
+			lineFields[sylField] = "%1o" % S
+			lineFields[locField] = "%03o" % LOC
+			lineFields[dmField] = "%2o" % DM
+			lineFields[dsField] = "%02o" % DS
 	if "useDat" in inputLine:
 		useDat = inputLine["useDat"]
 	
@@ -1263,6 +1686,47 @@ for entry in inputFile:
 		for n in range(int(operand)):
 			storeAssembled(lineNumber, 0, bssHop)
 			bssHop["DLOC"] += 1
+	elif ptc and operator == "BCI":
+		bciHop = hop.copy()
+		text = bciPad(operand[1:-1])
+		textLen = len(text)
+		# Recall that the test-string operand had previously had
+		# its spaces replaced by underlines, and that it needs to
+		# both have its delimiters removed and to be padded on the
+		# right with spaces to be the proper length for assembly.
+		operand = text.replace("_", " ")
+		opLen = len(operand)
+		#while opLen < textLen:
+		#	opLen += 1
+		#	operand += " "
+		# Now assemble it in blocks of 4 characters per assembled
+		# word.  At the same time, create the message that will
+		# ultimately be printed in the assembly listing, and 
+		# store it back into the input-file array so that it
+		# will be available at printout time.
+		printArray = []
+		for n in range(0, opLen, 4):
+			printLine = ""
+			octal = 0
+			for i in range(4):
+				char = operand[n+i]
+				if char not in legalCharsBCI:
+					addError(lineNumber, "Error: Character %c not legal for BCI" % char)
+					char = " "
+					printLine += "?"
+				else:
+					ba8421 = BA8421.index(char)
+					if pastBugs:
+						printLine += EBCDIClike[ba8421]
+					else:
+						printLine += char
+					octal |= ba8421 << (21 - 6 * i)
+			printArray.append(printLine)
+			storeAssembled(lineNumber, octal, bciHop)
+			bciHop["DLOC"] += 1
+		inputFile[lineNumber]["bciLines"] = printArray	
+		entry["bciLines"] = printArray
+		#addError(lineNumber, "Info: " + str(printArray))
 	elif operator in [ "DEC", "OCT", "HPC", "HPCDD", "DFW" ] or operator in forms:
 		assembled = 0
 		if operator in forms:
@@ -1391,7 +1855,7 @@ for entry in inputFile:
 		# Put the assembled value wherever it's supposed to 
 		storeAssembled(lineNumber, assembled, inputLine["hop"])
 	elif operator in operators:
-		print("%o\t%02o\t%o\t%03o\t%s" % (hop["IM"], hop["IS"], hop["S"], hop["LOC"], inputLine["raw"]), file=f)
+		#print("%o\t%02o\t%o\t%03o\t%d\t%s" % (hop["IM"], hop["IS"], hop["S"], hop["LOC"], lineNumber, inputLine["raw"]), file=f)
 		inDataMemory = False
 		loc = 0
 		residual = 0
@@ -1423,15 +1887,23 @@ for entry in inputFile:
 			except:
 				addError(lineNumber, "Error: Illegal operands")
 		elif operator in ["SHR", "SHL"]:
-			if loc == 0:
-				pass
-			elif operator == "SHR" and loc <= 2:
-				pass
-			elif operator == "SHL" and loc <= 2:
-				loc = loc << 4
+			if ptc:
+				if loc < 1 or loc > 6:
+					addError(lineNumber, "Error: Shift count must be 1, 2, 3, 4, 5, or 6")
+				else:
+					loc = 1 << (loc - 1)
+					if operator == "SHR":
+						loc |= 0o100
 			else:
-				addError(lineNumber, "Error: Shift count must be 0, 1, or 2")
-		elif operator in ["TRA", "TNZ", "TMI"]:
+				if loc == 0:
+					pass
+				elif operator == "SHR" and loc <= 2:
+					pass
+				elif operator == "SHL" and loc <= 2:
+					loc = loc << 4
+				else:
+					addError(lineNumber, "Error: Shift count must be 0, 1, or 2")
+		elif operator[:3] in ["TRA", "TNZ", "TMI"]:
 			if operand == "*":
 				loc = LOC
 				residual = S
@@ -1459,10 +1931,14 @@ for entry in inputFile:
 				# Which seems pretty convoluted, though pragmatically reasonable, so I may be
 				# misinterpreting what's going on.
 				loc = symbols[operand]["LOC"]
+				if operandModifierOperation == "+":
+					loc += operandModifier
+				elif operandModifierOperation == "-":
+					loc -= operandModifier
 				residual = symbols[operand]["S"]
 			elif operator == "TRA":
 				# The target location exists, but is not in this IM/IS/DM/DS.
-				# We must therefore substituted a HOP instruction instead,
+				# We must therefore substitute a HOP instruction instead,
 				# and allocate a HOP constant nameless variable.
 				hopConstant = formConstantHOP(symbols[operand])
 				constantString = "%09o" % hopConstant
@@ -1552,12 +2028,12 @@ for entry in inputFile:
 					addError(lineNumber, "Error: Cannot apply + or - in HOP operand")
 				elif "inDataMemory" in hop2 and hop2["inDataMemory"]:
 					# The operand is a variable, as it ought to be.
-					if hop2["DM"] != DM or (hop2["DS"] != DS and hop2["DS"] != 0o17):
-						if not useDat or S == 1:
-							addError(lineNumber, "Error: Operand not in current data-memory sector or residual sector")
+					#if (not ptc and hop2["DM"] != DM or (hop2["DS"] != DS and hop2["DS"] != 0o17)):
+					#	if not useDat: # or S == 1:
+					if not inSectorOrResidual(hop2["DM"], hop2["DS"], DM, DS, useDat, udDM, udDS):
+						addError(lineNumber, "Error: Operand not in current data-memory sector or residual sector (%o %02o)" % (hop2["DM"], hop2["DS"]))
 					loc = hop2["DLOC"]
-					if hop2["DS"] == 0o17:
-						residual = 1
+					residual = residualBit(hop2["DM"], hop2["DS"])
 				else:
 					# The operand is an LHS in instruction space.  If that's within the 
 					# current instruction sector, we should be able to convert the HOP 
@@ -1595,7 +2071,15 @@ for entry in inputFile:
 							"DS": ds,
 							"DLOC": loc
 						})
-		elif operator == "CDS":
+		elif ptc and operator == "CDS":
+			ofields = operand.split(",")
+			if len(ofields) != 2 or not ofields[0].isdigit() or not ofields[1].isdigit() or int(ofields[0],8) > 1 or int(ofields[1],8) > 15:
+				loc = 0
+				addError(lineNumber, "Error: Illegal operand for CDS")
+			loc = 0x80 | (int(ofields[0], 8) << 4) | int(ofields[1], 8)
+			residual = 0
+			#lineFields[adrField] = "%03o" % loc
+		elif (not ptc) and operator == "CDS":
 			if operand not in symbols:
 				addError(lineNumber, "Error: Symbol not found")
 				loc = 0
@@ -1645,47 +2129,55 @@ for entry in inputFile:
 				dm = int(constants[operand][1], 8)
 				ds = int(constants[operand][2], 8)
 				dloc = int(constants[operand][3], 8)
-				if DM != DM or DS != DS:
-					addError(lineNumber, "Error: Operand not in current data-memory sector or residual sector")
+				#if (not ptc and (dm != DM or (ds != DS and ds != 0o17)) or (ptc and ds != 0o17 and not (dm == DM and ds == DS))):
+				if not inSectorOrResidual(dm, ds, DM, DS, useDat, udDM, udDS):
+					addError(lineNumber, "Error: Operand not in current data-memory sector or residual sector (%o %02o)" % (dm, ds))
 				else:
 					loc = dloc
 					if ds == 0o17:
 						residual = 1
 			elif operand not in symbols:
-				addError(lineNumber, "Error: Symbol (" + operand + ") from operand not found")
+				if ptc:
+					loc,residual = allocateNameless(lineNumber, operand, useResidual = False)
+					#addError(lineNumber, "Error: Symbol (" + operand + ") from operand not found")
+				else:
+					addError(lineNumber, "Error: Symbol (" + operand + ") from operand not found")
 			else: 
 				hop2 = symbols[operand]
 				if hop2["inDataMemory"]:
-					if hop2["DM"] != DM or (hop2["DS"] != DS and hop2["DS"] != 0o17):
-						if not useDat or S == 1:
-							addError(lineNumber, "Error: Operand not in current data-memory sector or residual sector")
+					#if (not ptc and hop2["DM"] != DM or (hop2["DS"] != DS and hop2["DS"] != 0o17)):
+					#	if not useDat: # or S == 1:
+					if not inSectorOrResidual(hop2["DM"], hop2["DS"], DM, DS, useDat, udDM, udDS):
+						addError(lineNumber, "Error: Operand not in current data-memory sector or residual sector (%o %02o)" % (hop2["DM"], hop2["DS"]))
 					loc = hop2["DLOC"]
 					if operandModifierOperation == "+":
 						loc += operandModifier
 					elif operandModifierOperation == "-":
 						loc -= operandModifier
-					if hop2["DS"] == 0o17:
-						residual = 1
+					residual = residualBit(hop2["DM"], hop2["DS"])
 				else:
 					if hop2["IM"] != DM or hop2["IS"] != DS:
 						if not useDat or S == 1:
-							addError(lineNumber, "Error: Operand not in current data-memory sector")
+							addError(lineNumber, "Error: Operand not in current data-memory sector (%o %02o)" % (hop2["IM"], hop2["IS"]))
 					loc = hop2["LOC"]
 					if operandModifierOperation == "+":
 						loc += operandModifier
 					elif operandModifierOperation == "-":
 						loc -= operandModifier
-					if hop2["DS"] == 0o17:
-						residual = 1
+					residual = residualBit(hop2["DM"], hop2["DS"])
 		if loc > 0o377:
 			loc = loc & 0o377
 			residual = 1
+		#addError(lineNumber, "here C %d" % residual, trigger = 1469)
 		if "a8" in operators[operator]:
 			loc = (loc & 0o177) | (operators[operator]["a8"] << 7)
 		a81 = "%03o" % loc
 		a9 = "%o" % residual
 		assembled = assembled | (loc << 5) | (residual << 4)
 		storeAssembled(lineNumber, assembled, hop, False)
+		print("%o\t%02o\t%o\t%03o\t%d\t%05o\t%o\t%02o\t%s" % (hop["IM"], hop["IS"], \
+			hop["S"], hop["LOC"], lineNumber, assembled, hop["DM"], hop["DS"], \
+			inputLine["raw"]), file=f)
 	
 	if lineNumber != lastLineNumber:
 		errorsPrinted = []
@@ -1715,15 +2207,44 @@ for entry in inputFile:
 			print(header)
 		
 	else:
-		print("    " + line + " " + a81 + "  " + a9 + "  " + op + "  " + ("%9s" % constantString) + " " + expansionMarker + "\t" + raw)
+		if "bciLines" in entry:
+			clearLineFields()
+		lineFields[opField] = op
+		lineFields[constantField] = "%9s" % constantString
+		lineFields[expansionField] = expansionMarker
+		if "bciLines" in entry and "BCI" in raw and "^" in raw and "$" in raw:
+			iBCI = raw.index("BCI")
+			iCarat = raw.index("^")
+			iDollar = raw.index("$")
+			if iBCI < iCarat and iCarat < iDollar:
+				raw = raw[:iCarat] + raw[iCarat:iDollar].replace("_", " ") + raw[iDollar:]
+		lineFields[rawField] = raw
+		if a9 == "1" or not ptc:
+			lineFields[a9Field] = a9
+		if lineFields[adrField] == "":
+			lineFields[adrField] = a81
+		printLineFields()
+		if "bciLines" in entry:
+			hop = entry["expandedLine"]["hop"]
+			for n in range(len(entry["bciLines"])):
+				bciLine = entry["bciLines"][n]
+				clearLineFields()
+				lineFields[dmField] = "%o" % hop["DM"]
+				lineFields[dsField] = "%02o" % hop["DS"]
+				lineFields[adrField] = "%03o" % (hop["DLOC"] + n)
+				lineFields[constantField] = "%-9s" % bciLine
+				printLineFields()
 		if len(fields) > 1 and fields[1] == "MACRO" and fields[0] in macros:
 			macroLines = macros[fields[0]]["lines"]
+			clearLineFields()
 			for macroLine in macroLines:
 				lineText = ""
 				for n in macroLine:
-					lineText += n + "\t"
-				print(("%40s" % "") + "\t" + lineText)
-			print(("%40s" % "") + "\t\tENDMAC")
+					lineText += "%-8s" % n
+				lineFields[rawField] = lineText
+				printLineFields()
+			lineFields[rawField] = "        ENDMAC"
+			printLineFields()
 f.close()
 
 if checkTheOctals:
@@ -1735,11 +2256,21 @@ if checkTheOctals:
 		for sector in range(16):
 			for syllable in range(3):
 				for location in range(0o400):
+					if ptc and syllable < 2 and octals[module][sector][2][location] != None:
+						continue
 					assembledOctal = octals[module][sector][syllable][location]
 					checkOctal = octalsForChecking[module][sector][syllable][location]
 					if assembledOctal == None and checkOctal != None:
+						# This is an adequate test for LVDC, but for PTC it's
+						# still possible to have gotten to this point and to have
+						# a false positive, because the PTC octal listing doesn't
+						# distinguish between an entry containg 1 valid data value
+						# vs 2 valid instructions.  So we need to apply an additional
+						# test to check for that.
+						if ptc and syllable == 2:
+							continue
 						countMismatches += 1
-						print("Mismatch: Octal mismatch at %o,%02o,%o,%03o" %(module,sector,syllable,location))
+						print("Mismatch: Octal mismatch B at %o,%02o,%o,%03o" %(module,sector,syllable,location))
 print("")
 print("Assembly-message summary:")
 print("\tErrors:     %d" % countErrors)
@@ -1846,4 +2377,21 @@ for module in range(8):
 			print(formatLine % tuple(rowList))
 			print(formatFileLine % tuple(rowList), file=f)
 f.close()
-		
+
+# Prints out some debugging stuff about the order in which symbols are allocated.
+# It may be useful for figuring out where the assembly process stuff starts 
+# getting allocated to the wrong addresses, but is of no value outside of that
+# kind of debugging of the assembler.
+if False:
+	for record in allocationRecords:
+		#print(record)
+		symbol = record["symbol"]
+		inputLine = record["inputLine"]
+		lineNumber = record["lineNumber"]
+		page = inputLine["page"]
+		DM = record["DM"]
+		DS = record["DS"]
+		LOC = record["LOC"]
+		raw = inputLine["raw"]
+		print("PAGE=%-3d LINE=%-5d SYMBOL=%-15s DM=%o DS=%02o LOC=%03o:  %s" % (page, lineNumber, symbol, DM, DS, LOC, raw))
+	
