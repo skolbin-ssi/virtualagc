@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Ronald S. Burkey <info@sandroid.org>
+ * Copyright 2019,2020 Ronald S. Burkey <info@sandroid.org>
  *
  * This file is part of yaAGC.
  *
@@ -33,6 +33,16 @@
  * Compiler:    GNU gcc.
  * Reference:   http://www.ibibio.org/apollo
  * Mods:        2019-09-20 RSB  Began.
+ *              2020-06-05 RSB  Fixes for various bugs discovered in running
+ *                              self-test procedures from the PAST program:
+ *                              1)  SHL instructions were producing results
+ *                                  >26 bits in ACC, causing subsequent TMI
+ *                                  or TNZ instructions to fail.
+ *                              2)  A side effect of PRS sourced from memory
+ *                                  is supposed to be that the data goes into
+ *                                  ACC.
+ *                              3)  Assigned "spare" CIO 175 as an input port
+ *                                  rather than an output port.
  */
 
 #include <stdlib.h>
@@ -161,21 +171,30 @@ fetchData(int module, int residual, int sector, int loc, int *data,
       // may be an error (or perhaps not?), but that fetching from a
       // partially-empty location is not, since the LVDC/PTC code
       // is self-modifying, and may need to do that to modify the
-      // code.
+      // code.  But regardless, we can't actually treat it as an
+      // error when operating with the PTC panel, because it's
+      // very disruptive to suddenly drop into the native debugger.
       if (fetch0 == -1 && fetch1 == -1)
         {
           if (!inhibitFetchMessages)
             printf("Fetching data from empty location %o-%02o-%03o\n", module,
                 sector, loc);
-          runStepN = 0;
-          goto done;
+          if (!ptc)
+            {
+              runStepN = 0;
+              goto done;
+            }
+          *data = 0;
         }
-      if (fetch0 == -1)
-        fetch0 = 0;
-      if (fetch1 == -1)
-        fetch1 = 0;
-      *data = (fetch1 << 13) + fetch0;
-      *dataFromInstructionMemory = 1;
+      else
+        {
+          if (fetch0 == -1)
+            fetch0 = 0;
+          if (fetch1 == -1)
+            fetch1 = 0;
+          *data = (fetch1 << 13) + fetch0;
+          *dataFromInstructionMemory = 1;
+        }
     }
 
 #ifdef DEBUG_A_LOT
@@ -290,6 +309,42 @@ convertNativeToDataWord(int integer)
   return (integer & dataWordMask);
 }
 
+void
+checkForInterrupts(void)
+{
+  // Check if an interrupt has been triggered.
+  if (!state.masterInterruptLatch && !state.inhibitInterruptsOneCycle)
+    {
+      if (ptc)
+        {
+          int i, intLatch, intInhibit;
+          intLatch = state.cio[0154];
+          intInhibit = state.interruptInhibitLatches;
+          for (i = 0; i < 16;
+              i++, intLatch = intLatch << 1, intInhibit = intInhibit >> 1)
+            if ((intLatch & 0200000000) != 0 && (intInhibit & 1) == 0)
+              break;
+          if (i < 16)
+            {
+              state.masterInterruptLatch = 1;
+              state.hop = state.core[0][017][2][i];
+              //printf("Interrupt %d.\n", i + 1);
+            }
+        }
+      else // LVDC
+        {
+          if (state.pio[0137] != 0)
+            {
+              hopStructure_t hs;
+              state.masterInterruptLatch = 1;
+              parseHopConstant(state.hop, &hs);
+              state.hop = state.core[hs.im][017][2][0];
+            }
+        }
+    }
+
+}
+
 //////////////////////////////////////////////////////////////////////////////
 // The top-level function in this file.  Emulates a single instruction.
 
@@ -306,7 +361,7 @@ runOneInstruction(int *cyclesUsed)
   int cycleCount = 1, nextLOC, nextS, isHOP = 0;
   int64_t dummy;  // For multiplication intermediate result.
   hopStructure_t hopStructure, rawHopStructure, rawestHopStructure;
-  uint16_t instruction;
+  uint16_t instruction, operand9;
   uint8_t op, operand, residual, a8, a9;
   int32_t fetchedFromMemory;
   //int modOperand = 0;
@@ -319,8 +374,56 @@ runOneInstruction(int *cyclesUsed)
   state.cioChange = -1;
   state.prsChange = -1;
   state.lastHop = -1;
+  state.riLastHOP = state.hop;
+  if (state.busyCountPlotter)
+    {
+      state.busyCountPlotter--;
+      if (!state.busyCountPlotter)
+        state.bbPlotter = 0;
+    }
+  if (state.busyCountPrinter)
+    {
+      state.busyCountPrinter--;
+      if (!state.busyCountPrinter)
+        {
+          state.bbPrinter = 0;
+          state.cio210CarrBusy = 0;
+        };
+    }
+  if (state.busyCountTypewriter)
+    {
+      state.busyCountTypewriter--;
+      if (!state.busyCountTypewriter)
+        {
+          if (state.caseChange)
+            {
+              //printf("CASE %09o %09o %09o ", state.cio[0154], state.currentCaseInterrupt, state.currentTypewriterInterrupt);
+              state.caseChange = 0;
+              //state.cio[0154] &= ~state.currentCaseInterrupt;
+              state.cio[0154] |= state.currentTypewriterInterrupt;
+              //printf("-> %09o\n", state.cio[0154]);
+              state.busyCountTypewriter = CASE_CHANGE_BUSY_CYCLES;
+              dPrintoutsTypewriter("R1I CASE CHANGE");
+            }
+          else
+            {
+              state.bbTypewriter = 0;
+              dPrintoutsTypewriter("R1I READY");
+            }
+        }
+    }
+
+  state.ai3Shifter = (state.ai3Shifter << 1) & 0377777777;
+
+  // The following relates to how to report back a PRS instruction check-parity
+  // bit on the interrupt latch, via a CIO 154.  I'm not sure how this should
+  // interact with the regular CIO or PIO instructions for altering the interrupt
+  // latch, nor if the data should be available indefinitely.
+  if (state.prsParityDelayCount < 3)
+    state.prsParityDelayCount++;
 
   // Set global variables providing background info on the emulation.
+  state.inhibitInterruptsOneCycle = 0;
   dataFromInstructionMemory = 0;
   instructionFromDataMemory = 0;
 
@@ -373,6 +476,7 @@ runOneInstruction(int *cyclesUsed)
         goto done;
     }
   memcpy(&rawestHopStructure, &rawHopStructure, sizeof(hopStructure_t));
+  state.riLastInstruction = instruction;
 
   // Parse instruction into fields.
   state.lastInstruction = instruction;
@@ -381,6 +485,7 @@ runOneInstruction(int *cyclesUsed)
   operand = (instruction >> 5) & 0377;
   a8 = (operand >> 7) & 1;
   residual = a9;
+  operand9 = operand | (a9 << 8);
   // The following has something to do with EXM, but doesn't work as-is,
   // since it messes up almost all operands.  Fix later.
   //operand = (operand & ~3) | modOperand;
@@ -391,6 +496,7 @@ runOneInstruction(int *cyclesUsed)
     {
       // HOP
       isHOP = 1;
+      state.inhibitInterruptsOneCycle = 1;
       if (fetchData(hopStructure.dm, residual, hopStructure.ds, operand,
           &fetchedFromMemory, &dataFromInstructionMemory))
         {
@@ -434,13 +540,14 @@ runOneInstruction(int *cyclesUsed)
       // that state.prs has been written to.  The calling code must
       // interrogate these values in between instructions and take whatever
       // larger action is required.
-      int data;
+      int data, location;
       if (residual == 0 || (residual == 1 && operand <= 0373))
         {
           if (fetchData(hopStructure.dm, residual, hopStructure.ds, operand,
               &fetchedFromMemory, &dataFromInstructionMemory))
             goto done;
           data = fetchedFromMemory;
+          state.acc = data;
         }
       else if (residual == 1 && operand == 0374)
         {
@@ -453,8 +560,9 @@ runOneInstruction(int *cyclesUsed)
         data = state.acc;
       else
         goto done;
-      state.prs = data;
-      state.prsChange = 1;
+      location = operand | (residual << 8);
+      state.prs[location] = data;
+      state.prsChange = location;
     }
   else if (ptc && op == 005)
     {
@@ -466,20 +574,54 @@ runOneInstruction(int *cyclesUsed)
       // interrogate these values in between instructions and take whatever
       // larger action is required.
 
-      // The following is based on Figure 2-11 in the PTC documentation.
-      if (operand == 0154 || operand == 0204 || operand == 0214
-          || operand == 0220)
-        state.acc = state.cio[operand];
+      // The following is based on Figure 2-11 in the PTC documentation.  CIO 175
+      // does not appear at all in the documentation, but the PAST program calls it
+      // and 155, 161, 165, and 171 "spares".  It "tests" these spares by executing
+      // them and then by testing that CIO 175 has put 0 into ACC.  On the basis of
+      // this rather slim data, I infer that 175 is a spare input port while the others
+      // are spare outputs.
+      if (operand9 == 0154 || operand9 == 0214 || operand9 == 0220
+          || operand9 == 0175)
+        {
+          // The "gate" is needed only for reading PROG REG A, in which the lowest
+          // 9 bits are gated by bit written out on CIO 210 to the discrete outputs.
+          // When 1, those bits cause the corresponding bits on CIO 210 to be read
+          // back as 1, but when 0 gates in other signals on CIO 210, including the
+          // PRINTER/PLOTTER/TYPEWRITER BUSY bits.
+          state.acc = state.cio[operand9];
+          if (operand9 == 0214)
+            {
+              state.acc |= state.progRegA17_22 | state.bbPrinter
+                  | state.bbPlotter | state.bbTypewriter;
+              if ((state.cio[0210] & 8) != 0)
+                state.acc |= 1;
+              if ((state.cio[0210] & 16) != 0)
+                state.acc |= 1;
+              dPrintoutsTypewriter("RI CIO 214");
+            }
+          else if (operand9 == 0154)
+            {
+              state.acc |= state.cio210CarrBusy;
+              if (state.prsParityDelayCount > 0
+                  && state.prsParityDelayCount < 4)
+                {
+                  state.acc = (state.acc & ~0002000000)
+                      | state.prsDelayedParity[state.prsParityDelayCount];
+                }
+            }
+        }
       else
         {
-          state.cioChange = operand;
+          state.cioChange = operand9;
           // Note that for many CIO operations, it is the operation itself which
           // is significant, and not the specific info in ACC.  In other words,
           // the instruction above is often sufficient, and the instruction below
           // is often irrelevant.  However, there's no harm in the instruction
           // below, so we can keep it in all cases.
-          state.cio[operand] = state.acc;
+          state.cio[operand9] = state.acc;
         }
+      if (operand == 0001)
+        state.acc = state.ai3Shifter;
     }
   else if (op == 002)
     {
@@ -514,6 +656,7 @@ runOneInstruction(int *cyclesUsed)
       // TNZ
       if (state.acc != 0)
         {
+          state.inhibitInterruptsOneCycle = 1;
           nextLOC = operand;
           nextS = residual;
           state.lastHop = state.hop;
@@ -543,6 +686,7 @@ runOneInstruction(int *cyclesUsed)
   else if (op == 010)
     {
       // TRA
+      state.inhibitInterruptsOneCycle = 1;
       nextLOC = operand;
       nextS = residual;
       state.lastHop = state.hop;
@@ -566,20 +710,21 @@ runOneInstruction(int *cyclesUsed)
       // larger action is required.
 
       // Determine direction of data flow.  If the least-significant 2 bits of
-      // the operand are 11, then the data flows into the accumulator.
+      // the operand9 are 11, then the data flows into the accumulator.
       // Otherwise, the accumulator or memory is the source of the data.
-      if ((operand & 3) == 3)
-        state.acc = state.pio[operand];
+      if ((operand9 & 3) == 3)
+        state.acc = state.pio[operand9];
       else
         {
-          state.pioChange = operand;
+          state.pioChange = operand9;
           if (a8) // Source is the accumulator
-            state.pio[operand] = state.acc;
+            state.pio[operand9] = state.acc;
           else // Source is memory.
             {
-              if (fetchData(hopStructure.dm, residual, hopStructure.ds, operand, &fetchedFromMemory, &dataFromInstructionMemory))
+              if (fetchData(hopStructure.dm, residual, hopStructure.ds, operand,
+                  &fetchedFromMemory, &dataFromInstructionMemory))
                 fetchedFromMemory = 0;
-              state.pio[operand] = fetchedFromMemory;
+              state.pio[operand9] = fetchedFromMemory;
             }
         }
     }
@@ -600,6 +745,7 @@ runOneInstruction(int *cyclesUsed)
       // most-significant (26th) bit.
       if ((state.acc & signMask) != 0)
         {
+          state.inhibitInterruptsOneCycle = 1;
           nextLOC = operand;
           nextS = residual;
           state.lastHop = state.hop;
@@ -696,6 +842,7 @@ runOneInstruction(int *cyclesUsed)
             printf("Illegal SHF instruction\n");
             goto done;
             }
+          state.acc = state.acc & 0377777777;
         }
     }
   else if (!ptc && op == 016 && a8 == 0 && a9 == 1)
@@ -725,6 +872,7 @@ runOneInstruction(int *cyclesUsed)
         printf("Illegal SHF instruction\n");
         goto done;
         }
+      state.acc = state.acc & 0377777777;
     }
   else if (!ptc && op == 016 && a8 == 1 && a9 == 1)
     {
@@ -771,6 +919,7 @@ runOneInstruction(int *cyclesUsed)
       // instruction is executed.  But if all the details were worked out,
       // I think exiting the function normally would be better.
       cycleCount++;
+      state.inhibitInterruptsOneCycle = 1;
       goto reenterForEXM;
     }
   else if (op == 017)

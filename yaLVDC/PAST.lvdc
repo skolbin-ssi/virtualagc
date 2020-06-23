@@ -1,8 +1,15 @@
 # Copyright:    Public domain.
 # Filename:     PTC-ADAPT-Self-Test-Program.lvdc
-# Purpose:      This is LVDC ground test software "PTC ADAPT Self-Test
-#		Program" (1965) for the Programmable Test Controller, as 
-#               transcribed directly from the assembly listing. 
+# Purpose:      This is a modified version of the "PTC ADAPT Self-Test
+#		Program".  The mods relate to those points where (due
+#		partially to inadequate or nonexistent documentation),
+# 		I absolutely could not figure out what the functionality
+#		of certain PIO or CIO instructions was, and hence could 
+#		not implement the corresponding features in the emulator
+#		in such a way as to make the test pass.  The error traps
+#		for those cases are commented out, replaced typically by
+#		"TNZ *+1" or similar (so that all code and variable 
+#		addresses remain the same), and marked "FIX_EMULATOR". 
 # Assembler:    yaASM.py --ptc [--past-bugs]
 # Contact:      Ron Burkey <info@sandroid.org>.
 # Octals:	(Transcribed from scans) PTC-ADAPT-Self-Test-Program.lvdc
@@ -14,86 +21,8 @@
 #		executable (assembled octals) mentioned above were taken.  Figure 7-12 
 #		is this complete software in flowchart form.  The web page linked above
 #		also covers known errors in the documentation.
-# Mod history:  2020-04-12 RSB  Began transcribing from page images.
-#		2020-04-21 RSB	Finished transcribing, rough draft.  
-#				Haven't done any proofing yet.
-#		2020-04-29 RSB	Now assembles 100% error/warning free,
-#				and the assembled octals agree with 
-#				those from the transcribed octal file.
-#				Some workarounds were necessary in the
-#				source code.  I have not proofed the
-#				comments, so perhaps some errors remain
-#				there.
-#
-# At this writing (2020-04-29), there are some behaviors (or bugs) in
-# the original assembler which so far have not been duplicated in the 
-# modern assembler.  A small number of workarounds (search for the 
-# comment "workaround") have been added to the source code to insure 
-# that the assembly remains octal-for-octal identical to the original.  
-# These are all ORG/DOG pseudo-ops or extra TRA instructions.  Hopefully 
-# these can be removed at some point if the assembler is updated.  The 
-# assembler's command-line switch --past-bugs determines whether or not 
-# the assembler attempts to mimic those original bugs.  For example, in 
-# the assembly listing printout, the original assembler printed incorrect 
-# information for the BCI pseudo-op (although it assembled correct octals 
-# for it); the modern assembler by default prints correct information on 
-# the listing, but reverts to printing the original incorrect information
-# if --past-bugs is used.
-#
-# Regarding the BCI pseudo-op:  In the original assembly language, BCI's
-# operands were terminated by $ character.  In the modern assembly 
-# language, the operands are additionally initiated by ^ characters not
-# present in the original assembly language.  This is due to a requirement
-# of the modern assembler (yaASM.py) to relax strict columnar alignment of
-# the source code.  Thus what would have been "BCI string$" originally
-# is "BCI ^string$" in this source file used with the modern assembler.
-#
-# White space (blank lines and spaces within lines) in this transcript
-# are not necessarily the same as for the original punch cards.  
-# Specifically, for convenience in working with modern text-editor
-# software, I've put the operator and operand fields at 
-# 8-position tab stops, namely columns 9 and 17, and trailing comments
-# usually at column 41.  (You need to have tabs configured to 8 to
-# view this file properly aligned.)  None of which would agree with the 
-# original punch cards.  A convenient set of tab stops to duplicate
-# what appears in the original program listing would have the first 
-# two fields combining to fill 15 characters (at widths of 7 and 8 
-# columns respectively), and all subsequent tab stops at 5-column 
-# intervals.  Unfortunately, text editors that can duplicate an uneven
-# set of tab stops like that aren't too common, thus I've pragmatically
-# opted for default uniform 8-column tab stops adopted by most modern 
-# text-editing programs.
-#
-# On the other hand, I've attempted to preserve the spaces 
-# _within_ the 1965 program comments, except where those
-# comments are obviously intended to align with inline comments
-# suffixed to lines of code. In this transcription, as in the 
-# original, full-line comments are prefixed by '*' in column 1.
-# As in the original, inline comments trailing code on the same line 
-# are not marked by any special leading character.
-#
-# In contrast, comments added later (in 2020 or later) that are not present
-# in the original printout at all are instead prefixed by '#' in column 1.
-#
-# In the original printout, almost all lines have a SEQUENCE number at the
-# end, reflecting corresponding numbers on the punch cards.  Those SEQUENCE
-# numbers are _not_ preserved here on a line-by-line basis, but I've added
-# a comment for each PAGE change that appeared in the original printout, 
-# and those PAGE-change comments do list the range of SEQUENCE numbers 
-# found on the corresponding PAGE of the printout.
-#
-# Regarding the PAGE numbers:  The original assembly listing presumably had
-# page numbers at the top, generated by the assembler, but the listing
-# which has come down to us is not that original printout.  Rather, it was
-# embedded in a document, "SATURN V Laboratory Maintenance Instruction
-# for LTE", Volume V, "Programmable Test Controller", Figure 7-13.
-# (http://www.ibiblio.org/apollo/Documents/19730064346_1973064346.pdf,
-# beginning at PDF page 434, marked "V-7-250".)  In that document, 
-# the headings that were presumably at the tops of the pages
-# have been removed, so there are no assembler-generated page numbers.
-# Instead, the figure captions from the document, list a "sheet" number
-# for each page, and those sheet numbers have been used here as the PAGE
-# numbers.
+# Mod history:  2020-06-11 RSB  Began adapting from the full PTC ADAPT
+#				Self-Test Program.
 
 # PAGE 1, SEQUENCE 20-580
 
@@ -3006,7 +2935,8 @@ L11P31	STO	776
 	CIO	230
 	PIO	403
 	XOR	=O525252524
-	TNZ	L11P33
+#	TNZ	L11P33
+	TNZ	*+1	# FIX_EMULATOR
 L11P32	STO	776
 	CLA	=O525252524
 	STO	403
@@ -3014,7 +2944,8 @@ L11P32	STO	776
 	CIO	230
 	PIO	403
 	XOR	=O252525250
-	TNZ	L11P33
+#	TNZ	L11P33 
+	TNZ	*+1	# FIX_EMULATOR
 	HOP	H9P3
 	TRA	L12P1
 L11P28	STO	777

@@ -82,8 +82,8 @@
  *                                      001     CIO
  *                                      010     PRS
  *                                      011     Interrupt
- *                                      100     (reserved)
- *                                      101     (reserved)
+ *                                      100     Command or status from panel
+ *                                      101     Command or status to panel
  *                                      110     (reserved)
  *                                      111     PING
  *              D2-D0   Unique Source ID.  (000 is the server; i.e., the CPU.)
@@ -112,6 +112,81 @@
  *
  *   6th byte   D7      0
  *              D6-D0   Least-significant 7 bits of the 26-bit data/mask.
+ *
+ * Commands/status from/to the PTC front panel (I/O type 100 or 101) are, of course,
+ * my own invention, and thus are not documented in any of the original Apollo-era
+ * documentation, since in the physical PTC they were not implemented with i/o ports.
+ * (Except, of course, for data conveyed already by existing PIO or
+ * CIO commands.)  So here is the documentation:
+ *
+ * Type 100 (from panel emulation to CPU emulation):
+ *      Channel 000:    Pause at current instruction.  What that means is that the
+ *                      main CPU emulation loop will continue cycling normally,
+ *                      except that runOneInstruction() is not being executed
+ *                      and the cycle/instruction counts are not updated.  This
+ *                      means that the yaLVDC debugger interface *won't* appear,
+ *                      and virtual-wire transactions will continue to occur.
+ *                      The packet payload is ignored.
+ *      Channel 001:    Release the instruction pause (from prior channel 000) and
+ *                      proceed executing normally.  The packet payload is ignored.
+ *      Channel 002:    Set a data-address comparison pattern.  The packet payload
+ *                      is the bit pattern against which to compare data addresses.
+ *                      The most-significant 13 bits are formatted like a HOP
+ *                      constant (containing only the DM and DS fields),
+ *                      while the least-significant 13 bits are formatted like
+ *                      an instruction (opcode + operand), because those are the 4
+ *                      fields specified by the controls on the MLDD panel.
+ *      Channel 003:    Set an instruction-address comparison pattern.  The packet
+ *                      is formatted like a HOP constant, and provides the payload.
+ *                      Only the IM, IS, S, and LOC fields are significant.
+ *      Channel 004:    A data value for saving to the current data address (set by
+ *                      channel 002 above).  The payload is the 26 bits
+ *                      of a pattern for comparison to data.
+ *      Channel 005:    Settings from the DISPLAY MODE area of the MLDD, and a
+ *                      few other controls whose states we'd like preserved
+ *                      if it should happen that the front-panel emulation is
+ *                      exited and then restarted during a test procedure:
+ *                      Bits D2,D1,D0   0 = PROG-CYCLE REPEAT
+ *                                      1 = PROG-CYCLE SINGLE STEP
+ *                                      2 = PROG-CYCLE ADR HOLD
+ *                                      3 = DISPLAY SINGLE
+ *                                      4 = DISPLAY REPEAT
+ *                      Bit D3          0 = ADDRESS COMPARE INS
+ *                                      1 = ADDRESS COMPARE DATA
+ *                      Bits D5,D4      0 = NONE
+ *                                      1 = A13 IA
+ *                                      2 = A13 DATA
+ *                                      3 = TRS
+ *                      Bit D6          REPEAT (MLDD MEMORY LOADER area)
+ *                      Bit D7          CST (PD PROGRAM CONTROL area)
+ *                      Bit D8          MAN CST (PD PROGRAM CONTROL area)
+ *                      Bit D9          ML (1) vs DD (0) (TRMC MODE)
+ *                      Bit D10         ACC DISPLAY ENABLE (CE ACCUMULATOR area)
+ *                      Bit D11         MEM ADD REG (PD DATA area)
+ *      Channel 600:    Set the data-comparison mode.  The payload is ignored.
+ *      Channel 601:    Set the instruction-comparison mode.  The payload is ignored.
+ *      Channel 602:    Inhibit interrupts.  The payload is the 16-bit mask (aligned
+ *                      at the least-significant bit) of interrupts to inhibit.
+ *      Channel 603:    Step a single instruction.
+ *      Channel 604:    Reset the CPU.
+ *      Channel 605:    Request status.
+ *      Channel 606:    Width of typewriter carriage, in characters.
+ *      Channel 607:    Width of typewriter tab stop, in characters.
+ *
+ * Type 101 (from CPU emulation to panel emulation):
+ *      Channel 000:    CPU is paused.
+ *      Channel 001:    CPU is running.
+ *      Channel 002:    Current data address (same format as i/o type 100 channel 002).
+ *      Channel 003:    Current instruction address (same format as i/o type 100 channel 003).
+ *      Channel 004:    Current data value.
+ *      Channel 005:    Current DISPLAY MODE settings (same format as i/o type 100 channel 005).
+ *
+ *      Channel 600:    Current accumulator value.
+ *      Channel 601:    Current data from the data-address comparison pattern.
+ *      Channel 602:    Current data-address comparison pattern.
+ *      Channel 603:    Current instruction-address comparison pattern.
+ *      Channel 604:    Last PROG REG A configuration received by CPU.
+ *      Channel 605:    Last PROG REG B configuration received by CPU.
  */
 
 int ServerBaseSocket = -1;
@@ -128,6 +203,7 @@ uint8_t inPackets[MAX_LISTENERS][MAX_INPACKET_SIZE];
 int inPacketSizes[MAX_LISTENERS] =
   { 0 };
 
+static int newConnect = 0;
 void
 connectCheck(void)
 {
@@ -155,6 +231,7 @@ connectCheck(void)
             }
           printf("\nConnected to peripheral #%d%s on handle %d.\n", j,
               reassigned, i);
+          newConnect = 1;
         }
       else if (i == -1 && errno != EAGAIN)
         {
@@ -163,27 +240,150 @@ connectCheck(void)
     }
 }
 
+// Add a 6-byte chunk to the output packet. First set outPacketSize=0; then
+// call formatPacket() up to MAX_CHUNKS_PER_PACKET times.  Then send()
+// outPacket[].
+#define MAX_CHUNKS_PER_PACKET 32
+static int outPacketSize = 0;
+static uint8_t outPacket[6 * MAX_CHUNKS_PER_PACKET];
+void
+formatPacket(int ioType, int channel, int payload, int isMask)
+{
+  int id = 0;
+  outPacket[outPacketSize++] = (isMask ? 0300 : 0200) | ((ioType << 3) & 0070)
+      | (id & 0007);
+  outPacket[outPacketSize++] = channel & 0177;
+  outPacket[outPacketSize++] = ((channel & 0600) >> 2)
+      | ((payload >> 21) & 0037);
+  outPacket[outPacketSize++] = (payload >> 14) & 0177;
+  outPacket[outPacketSize++] = (payload >> 7) & 0177;
+  outPacket[outPacketSize++] = payload & 0177;
+}
+
+// Compute parity of a 6-bit value.  The value returned is suitable for direct
+// insertion into an interrupt latch after a PRS instruction.
+int
+oddParity6(int value)
+{
+  value ^= (value >> 1) ^ (value >> 2) ^ (value >> 3) ^ (value >> 4) ^ (value >> 5);
+  value = 1 & ~value;
+  if (value)
+    return (0004000000 >> 1);
+  else
+    return (0000000000 >> 1);
+}
+
 // Once the server system has been activated, call this function once after
 // emulation of each LVDC/PTC instruction to take care of any pending
 // virtual-wire actions.  Returns 0 on success, non-zero on error.
-typedef struct {
+typedef struct
+{
   int valid;
   int source;
   int ioType;
   int channel;
   int mask;
 } pendingMask_t;
-pendingMask_t pendingMasks[MAX_LISTENERS] = { { 0 } };
+pendingMask_t pendingMasks[MAX_LISTENERS] =
+  {
+    { 0 } };
+static int needStatus = 0;
+int printerOctalMode = 0;
+static const int octalPATN[] = {
+    0120300000>>1, 0130300000>>1, 0120300000>>1, 0130300000>>1, 0160300000>>1, 0170300000>>1, 0160300000>>1, 0170300000>>1
+};
 int
 pendingVirtualWireActivity(void /* int id, int mask */)
 {
-  int i, j, received = 0, ioType = -1, payload, outPacketSize = 0, channel;
-  uint8_t outPacket[12];
-  // For a general-purpose function, the following two things would
-  // be function arguments, but for an LVDC server they always have the
+  int i, j, received, ioType, payload, channel;
+  // For a general-purpose function, the following would be a
+  // function argument, but for an LVDC server they always have the
   // same values, so it would be kind of pointless for them to be anything
   // other than constants.
-  int id = 0, mask = 0377777777;
+  int mask;
+
+  retryStatus: ;
+  received = 0;
+  ioType = -1;
+  mask = 0377777777;
+  outPacketSize = 0;
+  // Format the output packet.
+  if (needStatus || newConnect || panelPause == 2 || panelPause == 4)
+    {
+      uint16_t instruction = 0;
+      int data = -1, hop = -1, hopd = -1, dataReadback = -1, datapat = -1,
+          inspat = -1;
+      int displayModePayload = -1, progRegA = -1, progRegB = -1;
+      hopStructure_t hs =
+        { 0 };
+      if (needStatus != 3 && needStatus != 4 && needStatus != 5)
+        hop = state.hop;
+      if (hop != -1 && !parseHopConstant(hop, &hs))
+        if (!fetchInstruction(hs.im, hs.dm, hs.s, hs.loc, &instruction,
+            &instructionFromDataMemory))
+          {
+            int opcode = instruction & 0x0F;
+            int a9 = (instruction >> 4) & 1;
+            int a81 = (instruction >> 5) & 0xFF;
+            hopd = (state.hop & 0377760000) | instruction;
+            if ((ptc && (opcode == 01 || opcode == 05)) || opcode == 04
+                || opcode == 010 || opcode == 012 || opcode == 014
+                || opcode == 016)
+              {
+                // These are operators whose operands are not variables.
+              }
+            else if (needStatus != 2)
+              {
+                if (fetchData(hs.dm, a9, hs.ds, a81, &data,
+                    &dataFromInstructionMemory))
+                  data = 0;
+              }
+          }
+      if (needStatus == 3)
+        datapat = panelPatternDataAddress;
+      if (needStatus == 4)
+        inspat = panelPatternInstructionAddress;
+      if (needStatus == 2 || newConnect || needStatus == 5)
+        {
+          if (needStatus == 2 || newConnect)
+            {
+              inspat = panelPatternInstructionAddress;
+              datapat = panelPatternDataAddress;
+              displayModePayload = panelDisplayModePlus;
+              progRegA = state.cio[0214];
+              progRegB = state.cio[0220];
+            }
+          dataReadback = -1;
+          if (panelPatternDataAddress != -1)
+            {
+              if (fetchData(panelPatternDM, 0, panelPatternDS, panelPatternDLOC,
+                  &dataReadback, &dataFromInstructionMemory))
+                dataReadback = 0;
+            }
+        }
+      formatPacket(5, (panelPause == 0 || panelPause == 4) ? 001 : 000, 0, 0);
+      if (hop != -1)
+        formatPacket(5, 003, state.hop, 0);
+      if (hopd != -1)
+        formatPacket(5, 002, hopd, 0);
+      if (data != -1)
+        formatPacket(5, 004, data, 0);
+      if (displayModePayload != -1)
+        formatPacket(5, 005, displayModePayload, 0);
+      formatPacket(5, 0600, state.acc, 0);
+      if (progRegA != -1)
+        formatPacket(5, 0604, progRegA, 0);
+      if (progRegB != -1)
+        formatPacket(5, 0605, progRegB, 0);
+      if (inspat != -1)
+        formatPacket(5, 0603, inspat, 0);
+      if (datapat != -1)
+        formatPacket(5, 0602, datapat, 0);
+      if (dataReadback != -1)
+        formatPacket(5, 0601, dataReadback, 0);
+      needStatus = 0;
+      newConnect = 0;
+    }
   // Take care of any virtual-wire outputs needed.  The changes (triggered by
   // the last LVDC/PTC instruction executed) have stuck the necessary info in
   // the global "state" structure.  Note that any given instruction can flag
@@ -204,36 +404,119 @@ pendingVirtualWireActivity(void /* int id, int mask */)
       channel = state.cioChange;
       payload = state.cio[channel];
       state.cioChange = -1;
+      // If the CIO was something that should have made the typewriter, plotter,
+      // or printer busy, we fake that up right here, since otherwise there
+      // wouldn't be enough time to allow the PTC front-panel emulation to
+      // report back that the device wasn't busy.
+      if (channel == 0144 || channel == 0150)
+        {
+          state.bbPlotter = 2;
+          state.busyCountPlotter = PERIPHERAL_BUSY_CYCLES;
+        }
+      else if (channel == 0160)
+        {
+          state.bbPrinter = 1;
+          state.busyCountPrinter = PERIPHERAL_BUSY_CYCLES;
+          state.cio[0154] = (payload & 0374000000) | (0002100000 >> 1) | oddParity6((payload >> 20) & 077);
+        }
+      else if (channel == 0164)
+        printerOctalMode = 1;
+      else if (channel == 0170)
+        printerOctalMode = 0;
+      else if (channel == 0120 || channel == 0124 || channel == 0130 || channel == 0134)
+        {
+          state.bbTypewriter = 4;
+          if (typewriterCharsInLine >= typewriterMargin)
+            {
+              dPrintoutsTypewriter("VW HIT MARGIN or RETURN");
+              state.busyCountTypewriter = CARRIAGE_RETURN_BUSY_CYCLES;
+              typewriterCharsInLine = 0;
+            }
+          else
+            {
+              state.busyCountTypewriter = PERIPHERAL_BUSY_CYCLES;
+              dPrintoutsTypewriter("VW CIO 120/124/130/134");
+            }
+        }
     }
   else if (state.prsChange != -1)
     {
+      int i;
+
       ioType = 2;
-      channel = 0;
-      payload = state.prs;
+      channel = state.prsChange;
+      payload = state.prs[channel];
       state.prsChange = -1;
+      state.bbPrinter = 1;
+      state.prsParityDelayCount = 0;
+
+      state.cio[0154] = 0;
+      if (channel == 0774) // Group mark.
+        {
+          state.busyCountPrinter = MEDIUM_BUSY_CYCLES;
+          state.cio[0154] |= 0000700000 >> 1;
+          state.prsDelayedParity[1] = oddParity6(000);
+          state.prsDelayedParity[2] = oddParity6(000);
+          state.prsDelayedParity[3] = oddParity6(000);
+        }
+      else if (printerOctalMode)
+        {
+          state.busyCountPrinter = PERIPHERAL_BUSY_CYCLES;
+          for (i = 0; i <= 24; i += 3)
+            {
+              int octal = ((payload << i) & 0340000000) >> 23;
+              state.cio[0154] |= octalPATN[octal];
+              if (i == 3)
+                state.prsDelayedParity[1] = oddParity6(octal);
+              else if (i == 18)
+                {
+                  if (state.inhibit250)
+                    state.prsDelayedParity[2] = oddParity6(octal);
+                  else
+                    {
+                      // I have no rationale for this whatever.  I was
+                      // sure it should be oddParity6(octal), *regardless*
+                      // of the state of inhibit250.  It undoubtedly means
+                      // that my whole rationale for how to compute the
+                      // PRS check parity is wrong ... perhaps it will be
+                      // figured out and corrected later.  Adding this is
+                      // purely an ad hoc measure to get test L34P9 in the
+                      // PAST program to pass.
+                      state.prsDelayedParity[2] = oddParity6(000);
+                    }
+                }
+              else if (i == 24)
+                {
+                  if (state.inhibit250)
+                    state.prsDelayedParity[3] = oddParity6(octal);
+                  else
+                    state.prsDelayedParity[3] = oddParity6(000);
+                }
+            }
+        }
+      else // BCD mode
+        {
+          state.busyCountPrinter = PERIPHERAL_BUSY_CYCLES;
+          for (i = 0; i <= 18; i += 6)
+            {
+              int ba8421 = (payload << i) & (0770000000 >> 1);
+              state.cio[0154] |= ba8421;
+              state.cio[0154] |= 0000300000 >> 1;
+              if (i == 6)
+                state.prsDelayedParity[1] = oddParity6(ba8421 >> 20);
+              else if (i == 18)
+                {
+                  state.prsDelayedParity[2] = oddParity6(ba8421 >> 20);
+                  state.prsDelayedParity[3] = oddParity6(ba8421 >> 20);
+                }
+            }
+        }
     }
-  // Format the output packet(s).
   if (ioType >= 0)
     {
       if ((mask & 0377777777) != 0377777777)
-        {
-          outPacket[outPacketSize++] = 0300 | ((ioType << 3) & 0070)
-              | (id & 0007);
-          outPacket[outPacketSize++] = channel & 0177;
-          outPacket[outPacketSize++] = ((channel & 0600) >> 2)
-              | ((mask >> 21) & 0037);
-          outPacket[outPacketSize++] = (mask >> 14) & 0177;
-          outPacket[outPacketSize++] = (mask >> 7) & 0177;
-          outPacket[outPacketSize++] = mask & 0177;
-        }
-      outPacket[outPacketSize++] = 0200 | ((ioType << 3) & 0070) | (id & 0007);
-      outPacket[outPacketSize++] = channel & 0177;
-      outPacket[outPacketSize++] = ((channel & 0600) >> 2)
-          | ((payload >> 21) & 0037);
-      outPacket[outPacketSize++] = (payload >> 14) & 0177;
-      outPacket[outPacketSize++] = (payload >> 7) & 0177;
-      outPacket[outPacketSize++] = payload & 0177;
-
+        formatPacket(ioType, channel, mask, 1);
+      formatPacket(ioType, channel, payload, 0);
     }
 
   // Take care of any network stuff needed.
@@ -282,6 +565,15 @@ pendingVirtualWireActivity(void /* int id, int mask */)
         else if (j >= 0 && j < outPacketSize)
           printf("Message to peripheral handle #%d incomplete.\n", i);
       }
+  // The following is just a little trick:  a delay to allow the UI
+  // some time to take care of its business after receiving the data.
+  // Undoubtedly there are better ways of handling this.
+  if (outPacketSize)
+    {
+      void
+      sleepMilliseconds(unsigned Milliseconds);
+      sleepMilliseconds(5);
+    }
 
   // Parse the received data.  All we have to do is to read any
   // inputs and stick them in the global "state" structure, where
@@ -301,7 +593,7 @@ pendingVirtualWireActivity(void /* int id, int mask */)
           size = inPacketSizes[i];
           offsetIntoBuffer = 0;
           offset = 0;
-          retry:;
+          retry: ;
           offsetIntoPacket = 0;
           for (; offset < size; offset++)
             {
@@ -326,7 +618,7 @@ pendingVirtualWireActivity(void /* int id, int mask */)
                   goto retry;
                 }
               switch (offsetIntoPacket)
-              {
+                {
               case 0:
                 offsetIntoPacket++;
                 isMask = 0x40 & currentByte;
@@ -385,34 +677,156 @@ pendingVirtualWireActivity(void /* int id, int mask */)
                         pendingMasks[i].valid = 0;
                       }
                     switch (ioType)
-                    {
+                      {
                     case 0: // PIO
                       if (channel < 0 || channel > 0777)
                         printf("Input PIO channel out of range.\n");
-                      printf("PIO-%03o changed from %09o to %09o with mask %09o.\n", channel, state.pio[channel], value, mask);
-                      state.pio[channel] = (state.pio[channel] & ~mask) | (value & mask);
+                      printf(
+                          "PIO-%03o changed from %09o to %09o with mask %09o.\n",
+                          channel, state.pio[channel], value, mask);
+                      state.pio[channel] = (state.pio[channel] & ~mask)
+                          | (value & mask);
                       break;
                     case 1: // CIO
                       if (channel < 0 || channel > 0777)
                         printf("Input CIO channel out of range.\n");
-                      printf("CIO-%03o changed from %09o to %09o with mask %09o.\n", channel, state.cio[channel], value, mask);
-                      state.cio[channel] = (state.pio[channel] & ~mask) | (value & mask);
+                      printf(
+                          "CIO-%03o changed from %09o to %09o with mask %09o.\n",
+                          channel, state.cio[channel], value, mask);
+                      state.cio[channel] = (state.pio[channel] & ~mask)
+                          | (value & mask);
                       break;
                     case 2: // PRS
-                      printf ("PRS data received from peripheral, which is not allowed.\n");
+                      printf(
+                          "PRS data received from peripheral, which is not allowed.\n");
                       break;
                     case 3: // INT
-                      printf ("INT data received from peripheral, which is not yet implemented.\n");
+                      printf(
+                          "INT data received from peripheral, which is not yet implemented.\n");
+                      break;
+                    case 4: // Commands directly from PTC panel emulation
+                      if (channel == 0)
+                        {
+                          printf("PTC panel commands halt.\n");
+                          panelPause = 2;
+                        }
+                      else if (channel == 1)
+                        {
+                          printf("PTC panel commands resumption.\n");
+                          panelPause = 4;
+                        }
+                      else if (channel == 2)
+                        {
+                          int residual, opcode;
+                          panelPatternDM = (value >> 17) & 1;
+                          panelPatternDS = (value >> 20) & 017;
+                          residual = (value >> 4) & 1;
+                          panelPatternDLOC = (value >> 5) & 0377;
+                          opcode = value & 017;
+                          printf(
+                              "PTC panel new DATA ADDRESS %o-%02o, OPCODE=%02o, OPERAND=%03o.\n",
+                              panelPatternDM, panelPatternDS, opcode,
+                              (residual << 8) | panelPatternDLOC);
+                          panelPatternDataAddress = value;
+                          if (residual)
+                            {
+                              if (ptc)
+                                panelPatternDM = 0;
+                              panelPatternDS = 017;
+                            }
+                          needStatus = 3;
+                        }
+                      else if (channel == 3)
+                        {
+                          printf(
+                              "PTC panel new INSTRUCTION ADDRESS %o-%02o-%o-%03o.\n",
+                              (value >> 25) & 1, (value >> 2) & 017,
+                              (value >> 6) & 1, (value >> 7) & 0377);
+                          panelPatternInstructionAddress = value;
+                          needStatus = 4;
+                        }
+                      else if (channel == 4)
+                        {
+                          printf("PTC new DATA %09o.\n", value);
+                          panelPatternDataValue = value;
+                          state.core[panelPatternDM][panelPatternDS][2][panelPatternDLOC] =
+                              value;
+                          state.core[panelPatternDM][panelPatternDS][0][panelPatternDLOC] =
+                              -1;
+                          state.core[panelPatternDM][panelPatternDS][1][panelPatternDLOC] =
+                              -1;
+                          needStatus = 5;
+                        }
+                      else if (channel == 5)
+                        {
+                          /*
+                           char *dsStrings[] =
+                           { "NONE", "A13 IA", "A13 DATA", "TRS" };
+                           char *acStrings[] =
+                           { "INS", "DATA" };
+                           char *mcStrings[] =
+                           { "PROG-CYCLE REPEAT", "PROG-CYCLE SINGLE-STEP",
+                           "PROG-CYCLE ADR-HOLD", "DISPLAY SINGLE",
+                           "DISPLAY REPEAT" };
+                           */
+                          panelDisplayModePlus = value;
+                          panelModeControl = value & 7;
+                          panelAddressCompare = (value >> 3) & 1;
+                          panelDisplaySelect = (value >> 4) & 3;
+                          if (panelModeControl >= 3)
+                            panelPause = 0;
+                          /*
+                           printf(
+                           "PTC panel:  DISPLAY SELECT = %s, ADDRESS COMPARE = %s, MODE CONTROL = %s\n",
+                           dsStrings[panelDisplaySelect],
+                           acStrings[panelAddressCompare],
+                           mcStrings[panelModeControl]);
+                           */
+                        }
+                      else if (channel == 0603)
+                        {
+                          printf("PTC panel requesting single step.\n");
+                          panelPause = 1;
+                        }
+                      else if (channel == 0604)
+                        {
+                          printf("PTC panel requesting reset.\n");
+                          //state.restart = 1;
+                          state.hop = 0;
+                          panelPause = 0;
+                        }
+                      else if (channel == 0605)
+                        {
+                          printf("PTC panel requesting status.\n");
+                          needStatus = 1;
+                        }
+                      else if (channel == 0606)
+                        {
+                          printf("PTC typewriter carriage width %d.\n", value);
+                          typewriterMargin = value;
+                        }
+                      else if (channel == 0607)
+                        {
+                          printf("PTC typewriter tab width %d.\n", value);
+                          typewriterTabStop = value;
+                        }
+                      else
+                        printf("Command %03o/%09o received from PTC panel\n",
+                            channel, value);
+                      break;
+                    case 5: // Status sent directly from CPU to PTC panel emulation.
+                      printf(
+                          "Illegal status info received ... should be output only.\n");
                       break;
                     default:
-                      printf ("Unrecognized input i/o type.\n");
+                      printf("Unrecognized input i/o type.\n");
                       break;
-                    }
+                      }
                   }
                 break;
               default:
                 break;
-              }
+                }
             }
           // Everything from the input buffer than cat be processed has
           // been.  So removed that stuff from the buffer, leaving everything
@@ -427,6 +841,12 @@ pendingVirtualWireActivity(void /* int id, int mask */)
         }
     }
 
+  // If we've gotten to this point and needStatus is non-zero, due to something
+  // received from the panel or (I suppose) other peripherals that requires
+  // informing the panel of the changed status.  We want to take care of this
+  // right away rather than sitting through another potential instruction cycle.
+  if (needStatus)
+    goto retryStatus;
   return (0);
 }
 

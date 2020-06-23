@@ -35,6 +35,7 @@
  * Compiler:    GNU gcc.
  * Reference:   http://www.ibibio.org/apollo
  * Mods:        2020-04-30 RSB  Began.
+ *              2020-05-21 RSB  Fixed arguments for DISASSEMBLE.
  */
 
 #include <stdlib.h>
@@ -147,6 +148,8 @@ enum commandTokens
   ctNEXT,
   ctDELETE,
   ctCONTINUE,
+  ctJUMP,
+  ctGOTO,
   ctLIST,
   ctDISASSEMBLE,
   ctX,
@@ -159,6 +162,7 @@ enum commandTokens
   ctQUIT,
   ctSET,
   ctSHOW,
+  ctPANEL,
   ctHELP,
   ctNone
 };
@@ -178,16 +182,27 @@ commandAssociation_t commandAssociations[] =
         { ctDELETE, "DELETE", "DELETE", "Delete all breakpoints." },
         { ctDELETE, "DELETE", "DELETE n", "Delete breakpoint n." },
         { ctCONTINUE, "CONTINUE", "CONTINUE", "Continue running emulation." },
-        { ctLIST, "LIST", "LIST", "List following block of source code." },
-        { ctLIST, "LIST", "LIST -", "List preceding block source code." },
-        { ctLIST, "LIST", "LIST [asm:]n", "List source block at line #n." },
-        { ctLIST, "LIST", "LIST [asm:]name", "List source block at function." },
+        { ctJUMP, "JUMP", "JUMP *address M-SS",
+            "Jump to code-memory address and assign DM/DS as M-SS and run." },
+            { ctJUMP, "JUMP", "JUMP [asm:]name",
+                "Jump. Operand is symbolic name of a HOP constant in data memory." },
+            { ctJUMP, "JUMP", "JUMP [asm:]name M-SS",
+                "Jump to symbol in code memory and assign DM/DS as M-SS." },
+            { ctJUMP, "JUMP", "JUMP octal",
+                "Jump using literal octal HOP constant." },
+            { ctGOTO, "GOTO", "GOTO ...",
+                "Same as JUMP, except pause rather than run." },
+            { ctLIST, "LIST", "LIST", "List following block of source code." },
+            { ctLIST, "LIST", "LIST -", "List preceding block source code." },
+            { ctLIST, "LIST", "LIST [asm:]n", "List source block at line #n." },
+            { ctLIST, "LIST", "LIST [asm:]name",
+                "List source block at function." },
             { ctDISASSEMBLE, "DISASSEMBLE", "DISASSEMBLE",
                 "Disassemble next LISTSIZE instructions in current HOP environment." },
             { ctDISASSEMBLE, "DISASSEMBLE", "DISASSEMBLE - D-TT",
                 "Disassemble preceding LISTSIZE instructions; D-TT is starting DM/DS." },
             { ctDISASSEMBLE, "DISASSEMBLE", "DISASSEMBLE M-SS-Y-LLL EEE D-TT",
-                "Disassemble from code address M-SS-Y-LLL EEE using data sector D-TT." },
+                "Disassemble from code address M-SS-Y-LLL to EEE using data sector D-TT." },
             { ctX, "X", "X[/[n][b|d|o]] address", "Show n words at address." },
             { ctX, "X", "X[/[n][b|d|o]] &[asm:]name", "Show n words at name." },
             { ctCLEAR, "CLEAR", "CLEAR [asm:]name",
@@ -215,6 +230,8 @@ commandAssociation_t commandAssociations[] =
             { ctSET, "SET", "SET *address = n",
                 "Store value n at memory address." },
             { ctSHOW, "SHOW", "SHOW LISTSIZE", "Show current size for LIST." },
+            { ctPANEL, "PANEL", "PANEL",
+                "Resume full control by PTC front panel." },
             { ctHELP, "HELP", "HELP", "Print this list of commands." },
             { ctNone, "" } };
 enum commandTokens
@@ -435,8 +452,8 @@ parseInputAddress(char *string, int *module, int *sector, int *syllable,
 {
   char s[256];
 
-  if (!strcasecmp(string, "PRS"))
-    return (atPrs);
+  //if (!strcasecmp(string, "PRS"))
+  //  return (atPrs);
   if (4
       == sscanf(string, "%o-%o-%o-%o%s", module, sector, syllable, location, s))
     return (atCode);
@@ -448,6 +465,8 @@ parseInputAddress(char *string, int *module, int *sector, int *syllable,
         return (atPio);
       else if (!strncasecmp(string, "CIO", 3))
         return (atCio);
+      else if (!strncasecmp(string, "PRS", 3))
+        return (atPrs);
     }
   return (atNone);
 }
@@ -478,9 +497,9 @@ formatFetchedValue(int value, char type /* o, d, or b */,
 {
   strcpy(formattedFetchedValue, "unknown");
   if (value == -1 && size)
-    strcpy(formattedFetchedValue, "not data value");
+    sprintf(formattedFetchedValue, "empty data location");
   else if (value == -1 && !size)
-    strcpy(formattedFetchedValue, "not code value");
+    sprintf(formattedFetchedValue, "empty code location");
   else if (type == 'o' && size)
     sprintf(formattedFetchedValue, "%09o (%09o)", value, value << 1);
   else if (type == 'o' && !size)
@@ -555,7 +574,8 @@ struct
   int valid;
   int error;
   int im, is, s, loc, dm, ds;
-} disassemblyState = { 0 };
+} disassemblyState =
+  { 0 };
 int
 setupDisassembly(uint32_t hop, hopStructure_t *hs)
 {
@@ -615,7 +635,9 @@ disassemble(void)
       goto error;
     }
 
-  m += sprintf(&lineBuffer[m], "%o-%02o-%o-%03o %o-%02o ", disassemblyState.im, disassemblyState.is, disassemblyState.s, disassemblyState.loc, disassemblyState.dm, disassemblyState.ds);
+  m += sprintf(&lineBuffer[m], "%o-%02o-%o-%03o %o-%02o ", disassemblyState.im,
+      disassemblyState.is, disassemblyState.s, disassemblyState.loc,
+      disassemblyState.dm, disassemblyState.ds);
   if (disassemblyState.loc > 0377)
     {
       m += sprintf(&lineBuffer[m], "(address past end of sector)");
@@ -893,8 +915,8 @@ disassemble(void)
       operandSymbol = findSymbolByAddress(disassemblyState.is,
           disassemblyState.im, a9, operand);
       if (operandSymbol == NULL)
-        sprintf(operandString, "%o-%0o-%o-%03o", disassemblyState.is,
-            disassemblyState.im, a9, operand);
+        sprintf(operandString, "%o-%0o-%o-%03o", disassemblyState.im,
+            disassemblyState.is, a9, operand);
       else
         strcpy(operandString, operandSymbol->name);
     }
@@ -935,7 +957,7 @@ gdbInterface(unsigned long instructionCount, unsigned long cycleCount,
   // runNextN is a global variable telling the LVDC/PTC instruction emulator
   // how many instructions to emulate (-1 is unlimited) before pausing next,
   // so obviously we accept user commands until this becomes non-zero.
-  while (runStepN <= 0)
+  while (panelPause || runStepN <= 0)
     {
       int i, j, found = 0;
       enum commandTokens commandToken;
@@ -974,6 +996,9 @@ gdbInterface(unsigned long instructionCount, unsigned long cycleCount,
         }
 
       nextCommand: ;
+      if (panelPause)
+        printf(
+            "\n*** CPU is paused by PTC panel ... no instructions will execute. ***\n");
 
       // Display registers.
       printf("\n HOP = ");
@@ -1013,10 +1038,30 @@ gdbInterface(unsigned long instructionCount, unsigned long cycleCount,
       formHopDescription(-1, 0, 017, 0376, hopBuffer, &hs2);
       printf("  (776)= %s\n", hopBuffer);
       formHopDescription(state.hopSaver, 0, 0, 0, hopBuffer, &hs2);
+      if (ptc)
+        {
+          //printf(" TYP = %d ", state.busyCountTypewriter);
+          //printf(" CNT = %d ", typewriterCharsInLine);
+          printf(" PRT = %d ", state.busyCountPrinter);
+          printf("  CNT = %d ", state.prsParityDelayCount);
+          printf("  PR1 = %09o ", state.prsDelayedParity[1]);
+          printf("  PR2 = %09o ", state.prsDelayedParity[2]);
+          printf("  PR3 = %09o ", state.prsDelayedParity[3]);
+
+          printf(" INT = %09o", state.cio[0154]);
+          printf("  INH = %09o", state.interruptInhibitLatches);
+          printf("  INB = %d\n", state.masterInterruptLatch);
+        }
+      else
+        {
+          printf(" INT = %09o", state.pio[0137]);
+          printf("  INB = %d\n", state.masterInterruptLatch);
+        }
       printf(" RET = %s\n", hopBuffer);
       printf("Instructions: %lu", instructionCount);
       printf(", Cycles: %lu", cycleCount);
-      printf(", Elapsed time: %f seconds\n", cycleCount * SECONDS_PER_CYCLE * clockDivisor);
+      printf(", Elapsed time: %f seconds\n",
+          cycleCount * SECONDS_PER_CYCLE * clockDivisor);
       if (found)
         {
           printf("Source line: ");
@@ -1036,14 +1081,14 @@ gdbInterface(unsigned long instructionCount, unsigned long cycleCount,
                   value, sourceLine->assembled);
               printf("From source:\t%o-%02o-%o-%03o %o-%02o %05o   %s\n",
                   sourceLine->module, sourceLine->sector, sourceLine->syllable,
-                  sourceLine->loc, sourceLine->dm, sourceLine->ds, sourceLine->assembled,
-                  sourceLine->line);
+                  sourceLine->loc, sourceLine->dm, sourceLine->ds,
+                  sourceLine->assembled, sourceLine->line);
               goto mustDisassemble;
             }
           else
-            printf("%o-%02o-%o-%03o %o-%02o %05o   %s\n",
-                sourceLine->module, sourceLine->sector, sourceLine->syllable,
-                sourceLine->loc, sourceLine->dm, sourceLine->ds, sourceLine->assembled,
+            printf("%o-%02o-%o-%03o %o-%02o %05o   %s\n", sourceLine->module,
+                sourceLine->sector, sourceLine->syllable, sourceLine->loc,
+                sourceLine->dm, sourceLine->ds, sourceLine->assembled,
                 sourceLine->line);
         }
       else
@@ -1099,8 +1144,9 @@ gdbInterface(unsigned long instructionCount, unsigned long cycleCount,
         printf("      (000-777 octal).\n");
         printf("    * CIO port:  CIO-LLL, where LLL is the port number\n");
         printf("      (000-777 octal).\n");
-        printf("    * PRS port:  Just the literal PRS, since there is only\n");
-        printf("      a single PRS port.\n");
+        printf(
+            "    * PRS port:  PRS-LLL, where LLL is the PRS operand number\n");
+        printf("      (000-777 octal).\n");
         printf(" 5. Source line numbers (decimal) come from the input .src\n");
         printf("    file, not from the original .lvdc source-code file.\n");
         printf(" 6. A free-running emulation can be paused by hitting any\n");
@@ -1112,7 +1158,17 @@ gdbInterface(unsigned long instructionCount, unsigned long cycleCount,
         printf(" 8. For commands like \"SET ... = n\", the number n is hex\n");
         printf("    if it has leading 0x, octal if it merely has leading\n");
         printf("    0, and decimal otherwise.\n");
+        printf(" 9. All data displayed from memory or written to memory does\n");
+        printf("    NOT include parity bits or locations for parity bits.\n");
         goto nextCommand;
+      case ctPANEL:
+        if (!ptc)
+          {
+            printf("Not emulating PTC; no PTC front panel available.\n");
+            goto nextCommand;
+          }
+        retVal = 0;
+        goto done;
       case ctBACKTRACE:
         {
           int i, n = 20, numBacktraces = (firstEmptyBacktrace
@@ -1303,8 +1359,10 @@ gdbInterface(unsigned long instructionCount, unsigned long cycleCount,
                   location++;
                   break;
                 case atPrs:
-                  formatFetchedValue(state.prs, formatType, 1, 2);
-                  printf("PRS: %s\n", formattedFetchedValue);
+                  if (location < 0 || location > 0777)
+                    goto badAddressX;
+                  formatFetchedValue(state.prs[location], formatType, 1, 2);
+                  printf("PRS-%03o: %s\n", location, formattedFetchedValue);
                   break;
                 default:
                   printf("Unrecognized format\n");
@@ -1496,8 +1554,8 @@ gdbInterface(unsigned long instructionCount, unsigned long cycleCount,
                 state.cioChange = location;
                 break;
               case atPrs:
-                destinationPointer = &state.prs;
-                state.prsChange = 0;
+                destinationPointer = &state.prs[location];
+                state.prsChange = location;
               default:
                 break;
                 }
@@ -1560,12 +1618,12 @@ gdbInterface(unsigned long instructionCount, unsigned long cycleCount,
                   endloc = 0377;
               }
             else if (count >= 4
-                && 3
+                && 4
                     == sscanf(fields[1], "%o-%o-%o-%o", &im, &is, &s, &startloc)
                 && 1 == sscanf(fields[2], "%o", &endloc)
                 && 2 == sscanf(fields[3], "%o-%o", &dm, &ds) && im <= 7
                 && is <= 017 && s <= 1 && startloc <= 0377 && endloc <= 0377
-                && dm <= 7 && ds >= 017)
+                && dm <= 7 && ds <= 017)
               {
               }
             else
@@ -1844,6 +1902,85 @@ gdbInterface(unsigned long instructionCount, unsigned long cycleCount,
               }
           }
         goto nextCommand;
+      case ctJUMP:
+      case ctGOTO:
+        {
+          int hop, dm, ds;
+          hopStructure_t hs;
+          char c;
+          symbol_t *symbol = NULL;
+          if (count == 2)
+            {
+              if (1 == sscanf(fields[1], "%o%c", &hop, &c) && hop >= 0
+                  && hop <= 0400000000)
+                goto foundJump;
+              else if (isalpha(fields[1][0]))
+                {
+                  symbol = findSymbol(fields[1], 0);
+                  if (symbol == NULL)
+                    {
+                      printf("Symbol not found in data memory.\n");
+                      goto nextCommand;
+                    }
+                  if (fetchData(symbol->module, 0, symbol->sector, symbol->loc, &hop, &dataFromInstructionMemory))
+                    {
+                      printf("Cannot fetch value of HOP constant from memory.\n");
+                      goto nextCommand;
+                    }
+                  goto foundJump;
+                }
+            }
+          else if (count == 3 && 2 == sscanf(fields[2], "%o-%o%c", &dm, &ds, &c))
+            {
+              if (fields[1][0] == '*')
+                {
+                  int module, sector, syllable, location;
+                  if (4 == sscanf(fields[1], "*%o-%o-%o-%o%c", &module, &sector, &syllable, &location, &c))
+                    {
+                      hs.im = module;
+                      hs.is = sector;
+                      hs.s = syllable;
+                      hs.loc = location;
+                      goto hopDescriptionFound;
+                    }
+                }
+              else if (isalpha(fields[1][0]))
+                {
+                  symbol = findSymbol(fields[1], 1);
+                  if (symbol == NULL)
+                    {
+                      printf("Symbol not found in code memory.\n");
+                      goto nextCommand;
+                    }
+                  hs.im = symbol->module;
+                  hs.is = symbol->sector;
+                  hs.s = symbol->syllable;
+                  hs.loc = symbol->loc;
+                  hopDescriptionFound:;
+                  hs.dm = dm;
+                  hs.ds = ds;
+                  hs.dupdn = 0;
+                  hs.dupin = 0;
+                  if (formHopConstant(&hs, &hop))
+                    {
+                      printf("Cannot form HOP constant.\n");
+                      goto nextCommand;
+                    }
+                  goto foundJump;
+                }
+            }
+          printf("Illegal syntax.\n");
+          goto nextCommand;
+          foundJump: ;
+          state.hop = hop;
+          if (commandToken == ctJUMP)
+            {
+              runStepN = INT_MAX;
+              break;
+            }
+          else
+            goto nextCommand;
+        }
       case ctDELETE:
         if (count < 2)
           {
