@@ -1,5 +1,5 @@
 /*
- Copyright 2020 Ronald S. Burkey <info@sandroid.org>
+ Copyright 2020-2021 Ronald S. Burkey <info@sandroid.org>
 
  This file is part of yaAGC.
 
@@ -33,8 +33,13 @@
  Compiler:	GNU gcc.
  Contact:	Ron Burkey <info@sandroid.org>
  Reference:	http://www.ibiblio.org/apollo/LVDC.html
- Mods:		2020-05-06 RSB.	Began adapting/simplifying from the yaAGC
- file agc_utilities.c.
+ Mods:		2020-05-06 RSB	Began adapting/simplifying from the yaAGC
+                                file agc_utilities.c.
+                2021-03-22 RSB  Changes related to compiling for Mac.
+                                (MSG_NOSIGNAL #define'd, and all
+                                #ifdef unix (or similar) extended to
+                                apple.)  Thanks to Ludo Visser for the
+                                change.
  */
 
 #include <stdio.h>
@@ -49,6 +54,10 @@
 #else
 #include <windows.h>
 #include <winsock2.h>
+#endif
+
+#if (defined(__APPLE__) && defined(__MACH__))
+#define MSG_NOSIGNAL 0
 #endif
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -418,14 +427,26 @@ pendingVirtualWireActivity(void /* int id, int mask */)
           state.bbPrinter = 1;
           state.busyCountPrinter = PERIPHERAL_BUSY_CYCLES;
           state.cio[0154] = (payload & 0374000000) | (0002100000 >> 1) | oddParity6((payload >> 20) & 077);
+          state.lastWasPrinter = 1;
         }
       else if (channel == 0164)
-        printerOctalMode = 1;
+        {
+          printerOctalMode = 1;
+          state.cio264Buffer = 0;
+          state.cio[0264] = 0;
+          state.lastWasPrinter = 1;
+        }
       else if (channel == 0170)
-        printerOctalMode = 0;
+        {
+          printerOctalMode = 0;
+          state.cio264Buffer = 0;
+          state.cio[0264] = 0;
+          state.lastWasPrinter = 1;
+        }
       else if (channel == 0120 || channel == 0124 || channel == 0130 || channel == 0134)
         {
           state.bbTypewriter = 4;
+          state.lastWasPrinter = 0;
           if (typewriterCharsInLine >= typewriterMargin)
             {
               dPrintoutsTypewriter("VW HIT MARGIN or RETURN");
@@ -943,7 +964,7 @@ InitializeSocketSystem(void)
   if (SocketSystemInitialized)
     return (0);
   SocketSystemInitialized = 1;
-#if defined(unix)
+#if defined(unix) || (defined(__APPLE__) && defined(__MACH__))
   return (0);
 #else
   WSADATA wsaData;
@@ -955,7 +976,7 @@ InitializeSocketSystem(void)
 void
 UnblockSocket(int SocketNum)
 {
-#if defined(unix)
+#if defined(unix) || (defined(__APPLE__) && defined(__MACH__))
   fcntl(SocketNum, F_SETFL, O_NONBLOCK);
 #else
   unsigned long nonBlock = 1;
@@ -1030,7 +1051,7 @@ EstablishSocket(unsigned short portnum, int MaxClients)
 
   if (bind(s, (struct sockaddr *) &sa, sizeof(struct sockaddr_in)) < 0)
     {
-#ifdef unix
+#if defined(unix) || (defined(__APPLE__) && defined(__MACH__))
       close(s);
 #else
       closesocket (s);
@@ -1081,7 +1102,7 @@ CallSocket(char *hostname, unsigned short portnum)
   if (connect(s, (struct sockaddr *) &sa, sizeof(sa)) < 0)
     {
       /* connect */
-#ifdef unix
+#if defined(unix) || (defined(__APPLE__) && defined(__MACH__))
       close(s);
 #else
       closesocket (s);
