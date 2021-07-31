@@ -72,7 +72,10 @@
  *             	  2017-08-31 RSB Added stuff associated with --debug.
  *             	  2018-10-12 RSB Added stuff associated with --simulation.
  *                2021-01-24 RSB reconstructionComments.
- *             	  2021-04-20 RSB Added stuff associated wtih --ebcdic.
+ *             	  2021-04-20 RSB Added stuff associated with --ebcdic.
+ *                2021-05-24 RSB Workaround for bad cygwin pow() function.
+ *                2021-05-24 RSB ... and apparently, for MINGW as well.
+ *                2021-05-24 RSB My workarounds were bogus.  I've rolled them back.
  */
 
 #ifndef INCLUDED_YAYUL_H
