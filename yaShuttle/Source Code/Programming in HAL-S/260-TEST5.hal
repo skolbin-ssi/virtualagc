@@ -1,0 +1,27 @@
+C/ Adapted from PDF p. 260 of "Programming in HAL/S".  Be sure to 
+C/ compile 189-IMU_DATA.hal in advance per the instructions given in that file.
+
+D INCLUDE TEMPLATE CPL189
+
+ T189: PROGRAM;
+     DECLARE IMU_INPT IMU_DATA-STRUCTURE(5);
+     DECLARE BEST INTEGER INITIAL(2);
+     DECLARE PITCH_ANGLE SCALAR;
+ 
+M    CALL XTRA ASSIGN(IMU_INPT     );
+S                             BEST;
+
+  XTRA:
+  PROCEDURE ASSIGN(BEST_IMU);
+     DECLARE BEST_IMU IMU_DATA-STRUCTURE;
+     
+C               ...
+
+M    PITCH_ANGLE = SCALAR(BEST_IMU.ATTITUDE  );
+S                                          1
+
+C               ...
+
+  CLOSE XTRA;
+ 
+ CLOSE T189;

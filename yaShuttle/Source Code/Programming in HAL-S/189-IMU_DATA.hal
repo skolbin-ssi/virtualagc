@@ -1,0 +1,22 @@
+C/ This file contains nothing but a structure template.  This template
+C/ has to be added to the template library prior to compiling source
+C/ files which need it, such as 260-TEST5 et al.  This requires the
+C/ various compiler switches:
+C/      yaHAL-S-FC:     --template
+C/      HAL_S_FC:       TEMPLATE --templib
+C/      HAL/S-FC PASS1: --parm="TEMPLATE,..."
+
+ CPL189: COMPOOL;
+ 
+ STRUCTURE IMU_DATA RIGID:
+    1 DELTA_V ARRAY(3) INTEGER DOUBLE,
+    1 ATTITUDE ARRAY(3) INTEGER,
+    1 TIME BIT(32),
+    1 STAT DENSE,
+       2 F1 BOOLEAN,
+       2 F2 BOOLEAN,
+       2 F3 BOOLEAN,
+       2 UNUSED BIT(13),
+    1 OP_MODE INTEGER;
+ 
+ CLOSE CPL189;

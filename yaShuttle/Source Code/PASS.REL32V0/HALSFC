@@ -1,0 +1,159 @@
+#!/bin/bash
+# This Linux/Mac script compiles a HAL/S program using the HAL/S-FC program,
+# which is assumed to be in the PATH.  
+
+# Just in case of working with .exe files in WINE.
+export WINEDEBUG=-all
+
+HALS_FILE="$1"
+TEST="$2"
+PARM_STRING="$3"
+TARGET="$4"
+EXT="$5"
+
+FILES_PORTED="FILE1.bin FILE2.bin FILE3.bin FILE4.bin FILE5.bin FILE6.bin"
+FILES_PORTED="$FILES_PORTED &&TEMPLIB.json &&TEMPINC.json SOURCECO.txt"
+FILES_PORTED="$FILES_PORTED LIT_CHAR.bin SYM_TAB.json LISTING2.txt"
+FILES_PORTED="$FILES_PORTED CROSS_REF.json TEMPLIB.json"
+FILES_LOCAL="listing2.txt TEMPLIB TEMPLIBB cards.bin COMMON0.out halmat.bin"
+FILES_LOCAL="$FILES_LOCAL litfile.bin vmem.bin COMMON1.out COMMON2.out"
+FILES_LOCAL="$FILES_LOCAL COMMON3.out COMMON4.out auxmat.bin objcode.bin"
+FILES_LOCAL="$FILES_LOCAL optmat.bin pass1.rpt pass1p.rpt pass1A.rpt"
+FILES_LOCAL="$FILES_LOCAL pass1pA.rpt flo.rpt opt.rpt aux.rpt pass2.rpt"
+FILES_LOCAL="$FILES_LOCAL pass3.rpt pass4.rpt cards monitor13.parms"
+FILES_LOCAL="$FILES_LOCAL auxp.rpt deck.bin extra.txt"
+rm $FILES_PORTED $FILES_LOCAL -rf &>/dev/null
+
+if [[ ! -f "$HALS_FILE" ]]
+then
+        echo ""
+        echo This script compiles a HAL/S file to an AP-101S object-code file.
+        echo ""
+        echo "     HALSFC SOURCE.hal [ TEST [ PARMS [ TARGET [ EXT ]]]]"
+        echo ""
+        echo Parameters appear in the indicated order.  Missing parameters
+        echo in the middle of the list can use \"\" as place markers for the.
+        echo defaults.  The parameters are interpreted as follows:
+        echo ""
+        echo "     SOURCE.hal The HAL/S source-code file."
+        echo "     TEST       Perform all available validity tests."
+        echo "     PARMS      Comma-separated list of compiler options."
+        echo "     TARGET     Either PFS (default) or BFS."
+        echo "     EXT        Either blank (default) or .exe (cross compilation)"
+        echo ""
+        exit 1
+fi
+
+PARM_LIST=${PARM_STRING//,/ }
+
+if [[ "$TARGET" == "BFS" ]]
+then
+	PASS1=HALSFC-PASS1B$EXT
+	FLO=HALSFC-FLO$EXT
+	OPT=HALSFC-OPTB$EXT
+	AUXP=HALSFC-AUXP$EXT
+	PASS2=HALSFC-PASS2B$EXT
+	PASS3=HALSFC-PASS3B$EXT
+	PASS4=HALSFC-PASS4$EXT
+	TEMPLIB=TEMPLIBB$EXT
+	CARDS--pdso=3,cards,E
+else
+	PASS1=HALSFC-PASS1$EXT
+	FLO=HALSFC-FLO$EXT
+	OPT=HALSFC-OPT$EXT
+	AUXP=HALSFC-AUXP$EXT
+	PASS2=HALSFC-PASS2$EXT
+	PASS3=HALSFC-PASS3$EXT
+	PASS4=HALSFC-PASS4$EXT
+	TEMPLIB=TEMPLIB
+	CARDS=--ddo=3,cards.bin,E
+fi
+
+$PASS1 \
+	--parm="$PARM_STRING" \
+	--ddi=0,"$HALS_FILE" \
+	--ddo=2,listing2.txt \
+	--pdsi=4,$TEMPLIB,E \
+	--pdsi=5,ERRORLIB \
+	--pdsi=6,ACCESS  \
+	--pdso=6,$TEMPLIB,E \
+	--commono=COMMON0.out \
+	--raf=B,7200,1,halmat.bin \
+	--raf=B,1560,2,litfile.bin \
+	--raf=B,3360,6,vmem.bin \
+	>pass1.rpt
+if [[ $? != 0 ]] ; then echo "Aborted after PASS1" ; exit 1 ; fi
+
+IGNORE_LINES='(HAL/S|FREE STRING AREA|NUMBER OF FILE 6|PROCESSING RATE|CPU TIME FOR|TODAY IS|COMPOOL.*VERSION)'
+if [[ "$TEST" != "" ]]
+then
+        echo ======================================================
+        ported="`which HAL_S_FC.py`"
+        ported="`dirname -- \"$ported\"`"
+        ported="`dirname -- \"$ported\"`"
+        ( HAL_S_FC.py $PARM_LIST --hal="$HALS_FILE" >pass1p.rpt ) && \
+        echo PASS1 cross-comparison test: || exit 1
+        for n in $FILES_PORTED ; do cp "$ported/$n" . ; done &>/dev/null
+        egrep -v "$IGNORE_LINES" pass1.rpt >pass1A.rpt
+        egrep -v "$IGNORE_LINES" pass1p.rpt >pass1pA.rpt
+        diff --strip-trailing-cr -q -s pass1A.rpt pass1pA.rpt
+        diff -s FILE1.bin halmat.bin
+        if [[ "$PARM_LIST" == *LISTING2* ]]
+        then
+                diff --strip-trailing-cr -q -s LISTING2.txt listing2.txt
+        fi
+        echo ======================================================
+fi
+
+$FLO \
+	--commoni=COMMON0.out \
+	--commono=COMMON1.out \
+	--raf=B,7200,1,halmat.bin \
+	--raf=B,1560,2,litfile.bin \
+	--raf=B,3360,6,vmem.bin \
+	>flo.rpt
+if [[ $? != 0 ]] ; then echo "Aborted after FLO" ; exit 1 ; fi
+
+$OPT \
+	--commoni=COMMON1.out \
+	--commono=COMMON2.out \
+	--raf=B,7200,1,halmat.bin \
+	--raf=B,1560,2,litfile.bin \
+	--raf=B,7200,4,optmat.bin \
+	--raf=B,3360,6,vmem.bin \
+	>opt.rpt
+if [[ $? != 0 ]] ; then echo "Aborted after OPT" ; exit 1 ; fi
+
+$AUXP \
+	--commoni=COMMON2.out \
+	--commono=COMMON3.out \
+	--raf=B,7200,1,auxmat.bin \
+	--raf=B,1560,2,litfile.bin \
+	--raf=B,7200,4,optmat.bin \
+	--raf=B,3360,6,vmem.bin \
+	>auxp.rpt
+if [[ $? != 0 ]] ; then echo "Aborted after AUXP" ; exit 1 ; fi
+
+$PASS2 \
+	$CARDS \
+	--ddo=4,deck.bin,E \
+	--pdsi=5,ERRORLIB \
+	--ddo=7,extra.txt \
+	--commoni=COMMON3.out \
+	--commono=COMMON4.out \
+	--raf=B,7200,1,auxmat.bin \
+	--raf=B,1560,2,litfile.bin \
+	--raf=B,1600,3,objcode.bin \
+	--raf=B,7200,4,optmat.bin \
+	--raf=B,3360,6,vmem.bin \
+	>pass2.rpt
+if [[ $? != 0 ]] ; then echo "Aborted after PASS2" ; exit 1 ; fi
+
+# PASS3 and PASS4 aren't ready for use yet.
+
+results="HALSFC `date`.results"
+mkdir "$results" &>/dev/null
+mv $FILES_PORTED $FILES_LOCAL "$results" &>/dev/null
+cp "$HALS_FILE" "$results" &>/dev/null
+
+echo "Compilation successful. Results in \"$results\"."

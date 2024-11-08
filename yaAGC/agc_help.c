@@ -18,7 +18,7 @@ static int gdbmi_status;
 
 
 
-static void gdbmiPrintHelpInfo()
+static void gdbmiPrintHelpInfo(void)
 {
 	printf("info breakpoints -- Status of user-settable breakpoints\n");
 	printf("info constants -- All constants or those matching REGEXP\n");
@@ -38,18 +38,18 @@ static void gdbmiPrintHelpInfo()
 	printf("info variables -- All variables or those matching REGEXP\n");
 }
 
-static void gdbmiPrintHelpShow()
+static void gdbmiPrintHelpShow(void)
 {
 	printf("show version -- Show what version of yaAGC this is\n");
 }
 
-static void gdbmiPrintHelpSet()
+static void gdbmiPrintHelpSet(void)
 {
 	printf("set prompt -- Set agc's prompt\n");
-	printf("set var -- assign value to variable or derefernced address\n");
+	printf("set var -- assign value to variable or dereferenced address\n");
 }
 
-static void gdbmiPrintHelpBreakpoints()
+static void gdbmiPrintHelpBreakpoints(void)
 {
 	printf("break -- Set breakpoint at specified line\n");
 	printf("delete -- Delete some breakpoints\n");
@@ -59,7 +59,7 @@ static void gdbmiPrintHelpBreakpoints()
 	printf("watch -- Set a watchpoint\n");
 }
 
-static void gdbmiPrintHelpData()
+static void gdbmiPrintHelpData(void)
 {
 	printf("disassemble -- Disassemble a specified section of memory\n");
 	printf("inspect -- Same as \"print\" command\n");
@@ -68,7 +68,7 @@ static void gdbmiPrintHelpData()
 	printf("x -- Examine memory: x/FMT ADDRESS\n");
 }
 
-static void gdbmiPrintHelpRunning()
+static void gdbmiPrintHelpRunning(void)
 {
 	printf("step -- Step program until it reaches a different source line\n");
 	printf("next -- Step program\n");
@@ -77,18 +77,18 @@ static void gdbmiPrintHelpRunning()
 	printf("quit -- Exit agc\n");
 }
 
-static void gdbmiPrintHelpFiles()
+static void gdbmiPrintHelpFiles(void)
 {
 	printf("list -- List specified function or line\n");
 }
 
-static void gdbmiPrintHelpStack()
+static void gdbmiPrintHelpStack(void)
 {
 	printf("bt -- Print backtrace of all stack frames\n");
 	printf("where -- Print backtrace of all stack frames\n");
 }
 
-static void gdbmiPrintHelpObscure()
+static void gdbmiPrintHelpObscure(void)
 {
 	printf("log -- Log instructions to a log file\n");
 	printf("getoct -- Converts EXP into octal value\n");
@@ -102,7 +102,7 @@ printf("\
 Set the VAR to a value.\n\
 VAR can be a symbol (e.g. MPAC) or a dereferenced ADDRESS.\n\
 ADDRESS can be a pseudo linear address (e.g. 0x6c or 0154) or you can\n\
-use the AGC native address format and speficy the bank and octal value.\n\
+use the AGC native address format and specify the bank and octal value.\n\
 \n\
 Examples setting values for the Multi Purpose Accumulator:\n\
   set MPAC=9\n\
@@ -214,7 +214,7 @@ printf("\
 Examine memory: x/FMT ADDRESS.\n\
 ADDRESS is an expression for the memory address to examine,\n\
 which can be a pseudo linear address (e.g. 0x6c or 0154) or you can\n\
-use the AGC native address format and speficy the bank and octal value.\n\
+use the AGC native address format and specify the bank and octal value.\n\
 FMT is a repeat count followed by a format letter and a size letter.\n\
 Format letters are o(octal), x(hex), d(decimal)\n\
 Size letters are b(byte), h(halfword), w(word).\n\
@@ -238,7 +238,7 @@ printf("\
 Print the value of symbol EXP.\n\
 EXP can be a symbol (e.g. MPAC or &MPAC) or a dereferenced ADDRESS.\n\
 ADDRESS can be a pseudo linear address (e.g. 0x6c or 0154) or you can\n\
-use the AGC native address format and speficy the bank and octal value.\n\
+use the AGC native address format and specify the bank and octal value.\n\
 \n\
 EXP may be preceded with /FMT, where FMT is a format letter\n\
 but no count or size letter (see \"x\" command). Without the \n\

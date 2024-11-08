@@ -1,4 +1,4 @@
-# Copyright 2003-2007,2009-2010,2016-2018,2020 Ronald S. Burkey <info@sandroid.org>
+# Copyright 2003-2007,2009-2010,2016-2018,2020,2022 Ronald S. Burkey <info@sandroid.org>
 #
 # This file is part of yaAGC.
 #
@@ -195,6 +195,17 @@
 #				the NVER version code.
 #		2020-12-24 RSB	Added Comanche045 and Manche45R2.
 #		2021-08-24 RSB	Added Luminary096 and removed LUM99R2.
+#		2022-08-07 RSB	Now allows copy the desktop icon to a *nix 
+#				desktop to fail, as this is reported to fail
+#				with Ubuntu running under WSL on Windows.
+#				Also, adds a prominent warning if Tcl/Tk is not
+#				found.
+#		2022-10-29 RSB	Added LM131R1, Sunrise45, Sunrise69.
+#		2022-11-17 RSB	Added Aurora 88.
+#		2023-05-02 RSB  Added Corona 261.
+#		2024-01-25 RSB  Added Skylark 48
+#		2024-05-13 RSB	Added Comanche 67
+#		2024-05-21 RSB  Added Comanche 72 and Manche72R3.
 #
 # The build box is always Linux for cross-compiles.  For native compiles:
 #	Use "make MACOSX=yes" for Mac OS X.
@@ -234,7 +245,7 @@
 # 	"make FORCE_clang=yes FORCE_cc=/usr/bin/clang-3.9 FORCE_CC=/usr/bin/clang++-3.9".
 
 # NVER is the overall version code for the release.
-NVER:=\\\"2020-12-24\\\"
+NVER:=\\\"2024-05-13\\\"
 DATE:=`date +%Y%m%d`
 
 # DON'T CHANGE THE FOLLOWING SWITCH *********************************
@@ -465,7 +476,8 @@ MISSIONS += Retread50 SundialE LUM69R2 Luminary097 Luminary098
 MISSIONS += Comanche051 Artemis071 Luminary178 Luminary163 Luminary173
 MISSIONS += SundanceXXX Sundance306ish Comanche044 Comanche045 Manche45R2
 # MISSIONS += LUM99R2
-MISSIONS += Luminary096
+MISSIONS += Luminary096 LM131R1 Sunrise45 Sunrise69 Aurora88
+MISSIONS += Corona261 Skylark048 Comanche067 Comanche072 Manche72R3
 # ifndef MACOSX
 MISSIONS += Solarium055 TRIVIUM TRIVIUM-repaired
 # endif
@@ -795,14 +807,21 @@ else
 	@echo "Icon=$$HOME/VirtualAGC/Resources/ApolloPatch2-transparent.png" >>$(iTMP)
 	@echo "Path=$$HOME/VirtualAGC/Resources" >>$(iTMP)
 	chmod +x $(iTMP)
-	mv $(iTMP) $$HOME/Desktop/VirtualAGC.desktop
+	-mv $(iTMP) $$HOME/Desktop/VirtualAGC.desktop
 	@echo ""
 	@echo "================================================================"
-	@echo "Run Virtual AGC from its desktop icon."
-	@echo "Or else, run Virtual AGC from a command-line as follows:"
+	@echo "Run Virtual AGC from its desktop icon.  If the icon doesn't"
+	@echo "exist or doesen't work, run Virtual AGC from a command-line"
+	@echo "as follows:"
 	@echo "  cd ~/VirtualAGC/Resources"
 	@echo "  ../bin/VirtualAGC"
 	@echo "================================================================"
+	@if ! which wish >/dev/null ; then \
+	echo "Important: Tcl/Tk not found. You should install it, or else" ; \
+	echo "simulations may silently fail!  You do NOT need to rebuild " ; \
+	echo "Virtual AGC after installing Tcl/Tk." ; \
+	echo "================================================================" ; \
+	fi
 endif
 endif
 endif

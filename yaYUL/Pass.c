@@ -122,6 +122,11 @@
  *             			accident, and similarly was failing by accident in Mac OS X.
  *            	2018-10-12 RSB	Added --simulation stuff.
  *            	2021-01-24 RSB  Added a "Reconstruction" marker in .lst files.
+ *            	2022-11-27 MAS  Added the "LOC" pseudo-op to Block I, and removed an old
+ *            	                workaround for the symbol "DECON" in Solarium 55.
+ *            	2023-05-15 MAS  Added support for the "VXM*" interpretive instruction for Block I.
+ *            	2023-05-23 MAS  Added support for the "DOT*" interpretive instruction for Block I.
+ *            	2023-06-21 MAS  Added support for the "TSU*" interpretive instruction for Block I.
  *
  * I don't really try to duplicate the formatting used by the original
  * assembly-language code, since that format was appropriate for
@@ -491,6 +496,7 @@ static ParserMatch_t ParsersBlock1[] =
     { "EXTEND", OP_BASIC, NULL, "INDEX", "$5777" },
     { "INDEX", OP_BASIC, ParseINDEX },
     { "INHINT", OP_BASIC, NULL, "INDEX", "$17" },
+    { "LOC", OP_PSEUDO, ParseSETLOC },
     { "MASK", OP_BASIC, ParseMASK },
     { "MP", OP_BASIC, ParseMP },
     { "NDX", OP_BASIC, ParseINDEX },
@@ -1146,6 +1152,7 @@ static InterpreterMatch_t InterpreterOpcodesBlock1[] =
     { "DMP*", 0121 },
     { "DMPR", 0067 },
     { "DOT", 0013 },
+    { "DOT*", 0011 },
     { "DSQ", 0044 },
     { "DSU", 0133 },
     { "DSU*", 0131 },
@@ -1188,6 +1195,7 @@ static InterpreterMatch_t InterpreterOpcodesBlock1[] =
     { "TSRT", 0073 },
     { "TSRT*", 0071 },
     { "TSU", 0063 },
+    { "TSU*", 0061 },
     { "UNIT", 0154 },
     { "UNIT*", 0150 },
     { "VAD", 0043 },
@@ -1203,6 +1211,7 @@ static InterpreterMatch_t InterpreterOpcodesBlock1[] =
     { "VSRT*", 0025 },
     { "VSU", 0163 },
     { "VXM", 0047 },
+    { "VXM*", 0045 },
     { "VXSC", 0167 },
     { "VXSC*", 0165 },
     { "VXV", 0007 },
@@ -1871,11 +1880,6 @@ Pass(int WriteOutput, const char *InputFilename, FILE *OutputFile, int *Fatals,
             }
           else if (whichColumn < 8)
             i++;
-
-          if (!strcmp(ParseInputRecord.Label, "DECON"))
-            {
-              j++;
-            }
 
           for (k = 9; k > 0; k--)
             strcpy(lastLines[k], lastLines[k - 1]);
